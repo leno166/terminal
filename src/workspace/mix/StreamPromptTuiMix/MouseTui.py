@@ -1,24 +1,22 @@
 """
-@文件: test.py
+@文件: MouseTui.py
 @作者: 雷小鸥
-@日期: 2026/5/30 15:34
+@日期: 2026/5/31 19:16
 @许可: MIT License
-@描述:
-
+@描述: 
 @版本: Version 0.1
 """
 import logging
-import threading
 from pathlib import Path
 
 from pynput import mouse
 
 from src.workspace.module.StreamPromptTui import App
 
-logger = logging.getLogger("MouseBridge")
+logger = logging.getLogger()
 
 
-class MouseBridge(App):
+class MouseApp(App):
     """监听鼠标移动、点击、滚动，将事件转为文本并通过 send() 推送到 TUI。"""
 
     def __init__(self):
@@ -102,13 +100,13 @@ def main():
 
     logger.info("===== 鼠标桥接器启动（pynput 模式），日志文件: %s =====", log_file)
 
-    bridge = MouseBridge()
+    bridge = MouseApp()
 
     completion_dict = {
-        "help": "显示帮助（无实际效果）",
-        "stop": "停止鼠标监听",
+        "help" : "显示帮助（无实际效果）",
+        "stop" : "停止鼠标监听",
         "start": "重新启动鼠标监听",
-        "quit": "退出程序（按 Ctrl+C）",
+        "quit" : "退出程序（按 Ctrl+C）",
     }
 
     try:
