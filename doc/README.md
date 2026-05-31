@@ -220,7 +220,10 @@ ProcConsole(["python", "my_server.py"]).run(
 
 ## 内部文档
 
-代码结构、消息体系、组件树等细节见 [`StreamPromptTui-design.md`](StreamPromptTui-design.md)。
+| 文档 | 说明 |
+|------|------|
+| [`StreamPromptTui-design.md`](StreamPromptTui-design.md) | Python/Textual 版本的代码结构、消息体系、组件树细节 |
+| [`StreamPromptTui-rust-migration.md`](StreamPromptTui-rust-migration.md) | Rust/ratatui 迁移方案 — C ABI 原生库重构计划 |
 
 ## License
 
