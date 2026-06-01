@@ -42,20 +42,20 @@ class MouseApp(App):
         if not self.running:
             return
         # 为避免数据过多，可以限制发送频率（例如每 50ms 一次），这里为了演示直接发送
-        self.send(f"🖱️ 移动 → ({x}, {y})")
+        self.recv(f"🖱️ 移动 → ({x}, {y})")
 
     def _on_click(self, x, y, button, pressed):
         """鼠标点击时调用。"""
         if not self.running:
             return
         action = "按下" if pressed else "释放"
-        self.send(f"🖱️ 点击 [{action}] {button} @ ({x}, {y})")
+        self.recv(f"🖱️ 点击 [{action}] {button} @ ({x}, {y})")
 
     def _on_scroll(self, x, y, dx, dy):
         """鼠标滚轮滚动时调用。"""
         if not self.running:
             return
-        self.send(f"🖱️ 滚动 Δ({dx}, {dy}) @ ({x}, {y})")
+        self.recv(f"🖱️ 滚动 Δ({dx}, {dy}) @ ({x}, {y})")
 
     def on_data(self, line: str) -> None:
         """
@@ -63,16 +63,16 @@ class MouseApp(App):
         这里简单回显，也可以添加与鼠标交互的命令（例如临时停止监听等）。
         """
         logger.info("用户输入: %s", line)
-        self.send(f"[回复] 收到命令: {line}")
+        self.recv(f"[回复] 收到命令: {line}")
         # 可选：支持动态开关监听
         if line.strip().lower() == "stop":
             self.running = False
-            self.send("🛑 鼠标监听已停止")
+            self.recv("🛑 鼠标监听已停止")
         elif line.strip().lower() == "start":
             if not self.running:
                 self.running = True
                 self._start_listener()
-                self.send("▶️ 鼠标监听已重新启动")
+                self.recv("▶️ 鼠标监听已重新启动")
 
     def stop(self):
         """停止监听器。"""

@@ -54,7 +54,7 @@ class KeyboardApp(App):
         except AttributeError:
             # 特殊键（如 Ctrl, Shift, F1 等）
             key_repr = str(key).replace('Key.', '')  # 变成 'ctrl', 'alt', 'f1' 等
-        self.send(f"⌨️ 按下: {key_repr}")
+        self.recv(f"⌨️ 按下: {key_repr}")
 
     def _on_release(self, key):
         """按键释放时调用。"""
@@ -64,7 +64,7 @@ class KeyboardApp(App):
             key_repr = key.char
         except AttributeError:
             key_repr = str(key).replace('Key.', '')
-        self.send(f"⌨️ 释放: {key_repr}")
+        self.recv(f"⌨️ 释放: {key_repr}")
 
         # 可选：按 Esc 键自动退出（如果想加这个功能，取消下面注释）
         # if key == keyboard.Key.esc:
@@ -72,7 +72,7 @@ class KeyboardApp(App):
         #     self.stop()
         #     self.exit()  # 需要从 textual 导入 exit，不建议在这里处理，保持简洁
 
-    def on_data(self, line: str) -> None:
+    def on_input(self, line: str) -> None:
         """
         用户输入命令时调用。
         支持 stop / start / clear 等。
@@ -82,21 +82,21 @@ class KeyboardApp(App):
         if cmd == "stop":
             if self.running:
                 self.running = False
-                self.send("🛑 键盘监听已停止")
+                self.recv("🛑 键盘监听已停止")
             else:
-                self.send("⚠️ 键盘监听已经是停止状态")
+                self.recv("⚠️ 键盘监听已经是停止状态")
         elif cmd == "start":
             if not self.running:
                 self.running = True
                 self._start_listener()
-                self.send("▶️ 键盘监听已重新启动")
+                self.recv("▶️ 键盘监听已重新启动")
             else:
-                self.send("⚠️ 键盘监听已在运行中")
+                self.recv("⚠️ 键盘监听已在运行中")
         elif cmd == "clear":
             # 清除屏幕（实际无法直接清除 RichLog，可以发送一个清屏提示或留空）
-            self.send("🧹 请输入 :clear 来手动清屏（暂不支持自动清屏）")
+            self.recv("🧹 请输入 :clear 来手动清屏（暂不支持自动清屏）")
         else:
-            self.send(f"[回复] 收到命令: {line}")
+            self.recv(f"[回复] 收到命令: {line}")
 
     def stop(self):
         """停止监听器，释放资源。"""

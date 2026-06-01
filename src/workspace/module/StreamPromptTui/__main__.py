@@ -37,13 +37,13 @@ class MyBridge(_IBridge):
         while True:
             time.sleep(1)
             i += 1
-            self.send(str(i))
+            self.recv(str(i))
 
     # ── 实现 IBridge.on_data ───────────────────────────
 
-    def on_data(self, line: str) -> None:
+    def on_input(self, line: str) -> None:
         logger.info("外部收到: %s", line)
-        self.send(f"{line}xxx")
+        self.recv(f"{line}xxx")
 
 
 # ═══════════════════════════════════════════════════════════

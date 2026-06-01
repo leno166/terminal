@@ -42,12 +42,12 @@ class _IBridge(_ABC):
 
     # ── 公开接口 ──────────────────────────────────────
 
-    def send(self, line: str) -> None:
+    def recv(self, line: str) -> None:
         """入队一个字符串，后台线程取出后拼成 LineMsg 并 emit。线程安全。"""
         self._queue.put(line)
 
     @_abstractmethod
-    def on_data(self, line: str) -> None:
+    def on_input(self, line: str) -> None:
         """收到行文本时的回调入口。子类必须实现。"""
         ...
 
@@ -68,7 +68,7 @@ class _IBridge(_ABC):
         """event_bus 订阅回调：解包 LineMsg.line → 交给 on_data。"""
         if msg.role == Role.BRIDGE:
             return
-        self.on_data(msg.line)
+        self.on_input(msg.line)
 
     def _run(self) -> None:
         """后台线程：阻塞等队列，取出 str 拼成 LineMsg 后 emit。"""
