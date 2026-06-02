@@ -1,11 +1,7 @@
 """
-@文件: doip.py
-@作者: 雷小鸥
-@日期: 2026/6/1 22:33
-@许可: MIT License
-@描述:
-        DoIP 层 — Endpoint + SocketManager + Protocol + Sock
-@版本: Version 0.1
+@文件: DoIp.py
+@描述: DoIP 层 — Endpoint + SocketManager + Protocol + Sock
+      无抽象类，无外部依赖（除 socket 和 helper）
 """
 import threading
 import socket
@@ -138,10 +134,14 @@ class SocketManager:
         """单次 accept 循环，获取初始连接"""
         if not self._sock:
             raise RuntimeError("管理器未启动")
+
+        logger.info('accept 启动')
         while True:
             try:
                 sock, addr = self._sock.accept()
+                logger.debug('accept once | addr: %s', addr)
             except TimeoutError:
+                logger.debug('超时退出')
                 break
             sock.settimeout(self._timeout)
             ip, port = addr
@@ -247,7 +247,7 @@ class DoIPEndpoint:
 
     def send(self, uds: bytes) -> bytes:
         if self._ecu is None:
-            raise Protocol.ERROR('[DOIP] 没有设置 ecu 逻辑地址')
+            raise Protocol.ERROR('[DoIp] 没有设置 ecu 逻辑地址')
 
         frame = self._protocol.encode(uds, self._tester, self._ecu)
         logger.debug('TX DoIp: %s', frame.hex(' '))
@@ -260,7 +260,12 @@ class DoIPEndpoint:
                 logger.warning('DoIP 通信失败，触发重连: %s', e)
                 self._manager.reconnect(timeout=5.0)
                 self._manager.send(frame)
-                response = self._manager.recv()
+
+                try:
+                    response = self._manager.recv()
+                except (ConnectionError, TimeoutError, OSError):
+                    logger.error('重连失败', exc_info=True)
+                    raise TimeoutError
 
         logger.debug('RX DoIp: %s', response.hex(' '))
         return self._protocol.decode(response, self._tester, self._ecu)

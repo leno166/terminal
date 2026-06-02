@@ -16,3 +16,7 @@ build/
 
 # 日志
 *.log
+
+# Diag 模块 — 敏感配置文件
+src/workspace/module/Diag/config/*.yaml
+!src/workspace/module/Diag/config/*.example.yaml

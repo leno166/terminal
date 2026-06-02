@@ -1,78 +1,17 @@
 """
 @文件: uds.py
-@作者: 雷小鸥
-@日期: 2026/6/1 22:35
-@许可: MIT License
-@描述:
-    UDS 层 — View + KeepAlive + Session
-@版本: Version 0.1
+@描述: UDS 层 — KeepAlive + Session
+      无抽象类，无外部依赖（除 doip）
 """
 import threading
 from typing import Any, Callable, Literal, Self
 from logging import getLogger
 from types import MappingProxyType
 
-from .doip import DoIPEndpoint
-from .handlers import IHandler, HexCodec, Passthrough, HexDecoder
+from .DoIp import DoIPEndpoint
+from .response import UdsResponse
 
 logger = getLogger(__name__)
-
-
-# ================== View ==================
-
-class View:
-    """三槽管理器：持有 codec/service/decoder，管理注册/查询/切换"""
-
-    def __init__(self, handlers: list[IHandler]):
-        self._handlers: dict[str, IHandler] = {}
-        self._cur_codec: IHandler | None = None
-        self._cur_service: IHandler | None = None
-        self._cur_decoder: IHandler | None = None
-
-        for h in handlers:
-            self._handlers[h.name] = h
-            if h.type == 'codec' and self._cur_codec is None:
-                self._cur_codec = h
-            elif h.type == 'service' and self._cur_service is None:
-                self._cur_service = h
-            elif h.type == 'decoder' and self._cur_decoder is None:
-                self._cur_decoder = h
-
-    @property
-    def list(self) -> list[dict]:
-        """所有已注册 handler 信息"""
-        return [
-            {'name': h.name, 'type': h.type, 'desc': h.desc}
-            for h in self._handlers.values()
-        ]
-
-    def use(self, name: str) -> 'View':
-        h = self._handlers[name]
-        if h.type == 'codec':
-            self._cur_codec = h
-        elif h.type == 'service':
-            self._cur_service = h
-        elif h.type == 'decoder':
-            self._cur_decoder = h
-        return self
-
-    @property
-    def codec(self) -> IHandler:
-        if self._cur_codec is None:
-            raise RuntimeError("未设置编码视图")
-        return self._cur_codec
-
-    @property
-    def service(self) -> IHandler:
-        if self._cur_service is None:
-            raise RuntimeError("未设置交互视图")
-        return self._cur_service
-
-    @property
-    def decoder(self) -> IHandler:
-        if self._cur_decoder is None:
-            raise RuntimeError("未设置解码视图")
-        return self._cur_decoder
 
 
 # ================== KeepAlive ==================
@@ -119,14 +58,13 @@ class KeepAlive:
 # ================== Session ==================
 
 class Session:
-    """用户唯一入口：持有 Endpoint + View + KeepAlive"""
+    """用户唯一入口：持有 Endpoint + KeepAlive"""
 
     def __init__(self, ip: str, ecus: dict[str, tuple[str, int]],
                  port: int = 13400, tester: int = 0x0E80,
-                 timeout: float = 0.5, listen_count: int = 10,
+                 timeout: float = 1, listen_count: int = 10,
                  doip_version: int = 0x02, doip_msg_type: int = 0x8001,
                  byte_order: Literal['little', 'big'] = 'big',
-                 handlers: list[IHandler] | None = None,
                  keepalive_interval: float = 0.5,
                  keepalive_payload: bytes = b'\x3E\x00'):
         self._ip = ip
@@ -141,15 +79,6 @@ class Session:
 
         self._keepalive_interval = keepalive_interval
         self._keepalive_payload = keepalive_payload
-
-        all_handlers: list[IHandler] = [
-            HexCodec('hex_in', 'codec', '十六进制输入'),
-            Passthrough('passthrough', 'service', '单轮直通'),
-            HexDecoder('hex_out', 'decoder', '十六进制输出'),
-        ]
-        for handler in (handlers or []):
-            all_handlers.append(handler)
-        self._view_manager = View(all_handlers)
 
         self._endpoint: DoIPEndpoint | None = None
         self._keepalive: KeepAlive | None = None
@@ -171,10 +100,25 @@ class Session:
 
     # --- 内部 ---
 
-    def _start_keepalive(self) -> None:
-        if self._keepalive:
-            self._keepalive.stop()
+    @staticmethod
+    def _pre_send(data: str) -> bytes:
+        """前置：校验输入为字符串、偶数长度、合法 hex → bytes"""
+        if not isinstance(data, str):
+            raise TypeError(f"UDS 数据必须为字符串，收到: {type(data).__name__}")
+        frame = data.replace(' ', '').upper()
+        if len(frame) % 2:
+            raise ValueError('UDS 长度必须为偶数')
+        try:
+            return bytes.fromhex(frame)
+        except ValueError:
+            raise ValueError(f'非法 UDS 数据: {data}')
 
+    @staticmethod
+    def _post_receive(data: bytes) -> UdsResponse:
+        """后置：返回字节粗略拆分为空格分隔的 hex 字符串"""
+        return UdsResponse.from_bytes(data)
+
+    def _start_keepalive(self) -> None:
         if not self._endpoint:
             raise RuntimeError("Endpoint 未初始化")
 
@@ -184,6 +128,11 @@ class Session:
             payload=self._keepalive_payload,
         )
         self._keepalive.start()
+
+    def _stop_keepalive(self) -> None:
+        if self._keepalive:
+            self._keepalive.stop()
+            self._keepalive = None
 
     def _filter_ecus(self) -> dict[str, tuple[str, int]]:
         if not self._endpoint:
@@ -205,10 +154,6 @@ class Session:
         with self._state_lock:
             return MappingProxyType(self._ecus)
 
-    @property
-    def views(self) -> list[dict]:
-        return self._view_manager.list
-
     # --- 公开方法 ---
 
     def start(self) -> bool:
@@ -227,11 +172,11 @@ class Session:
 
         self._ecus = self._filter_ecus()
 
-        ecu_name = next(iter(self._ecus.keys()))
-        self.on(ecu_name)
-
         with self._state_lock:
             self._opened = True
+
+        ecu_name = next(iter(self._ecus.keys()))
+        self.on(ecu_name)
 
         logger.info('会话已开启')
         return True
@@ -243,9 +188,7 @@ class Session:
             self._cur_ecu = ''
             self._opened = False
 
-        if self._keepalive:
-            self._keepalive.stop()
-            self._keepalive = None
+        self._stop_keepalive()
         if self._endpoint:
             self._endpoint.stop()
             self._endpoint = None
@@ -265,17 +208,14 @@ class Session:
         if not self._endpoint:
             raise RuntimeError("Endpoint 未初始化")
 
+        self._stop_keepalive()
         self._endpoint.select(ip, ecu)
         self._start_keepalive()
 
         logger.info('已切换到 ECU: %s, IP: %s, 地址: 0x%04X', name, ip, ecu)
         return self
 
-    def view(self, name: str) -> Self:
-        self._view_manager.use(name)
-        return self
-
-    def send(self, data: Any) -> Any:
+    def send(self, data: str) -> UdsResponse:
         with self._state_lock:
             if not self._opened:
                 raise RuntimeError("会话未启动")
@@ -283,9 +223,8 @@ class Session:
                 raise RuntimeError("Endpoint 未初始化")
             endpoint = self._endpoint
 
-        return self._view_manager.service.execute(
-            data,
-            send=endpoint.send,
-            encode=self._view_manager.codec.handle,
-            decode=self._view_manager.decoder.handle,
-        )
+        logger.info('TX: %s', data)
+        payload = self._pre_send(data)
+        response = endpoint.send(payload)
+        logger.info('RX: %s', response.hex(' '))
+        return self._post_receive(response)

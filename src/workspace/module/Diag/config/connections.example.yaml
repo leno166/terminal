@@ -1,0 +1,17 @@
+# 连接配置模板 — 复制为 connections.yaml 并修改为实际环境值
+# 此文件可安全提交到 git（仅含示例占位符）
+
+defaults:
+  ip: "<YOUR_TESTER_IP>"
+  port: 13400
+  tester: 0x0E80
+  platform: "<YOUR_PLATFORM>"
+  serial_version: 0.0
+
+ecus:
+  mcu:
+    ip: "<YOUR_MCU_IP>"
+    logical_addr: 0x1001
+  soc:
+    ip: "<YOUR_SOC_IP>"
+    logical_addr: 0x1002
