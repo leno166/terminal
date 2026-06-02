@@ -1,11 +1,11 @@
 """
-@文件: DoIp.py
+@文件: doip.py
 @描述: DoIP 层 — Endpoint + SocketManager + Protocol + Sock
       无抽象类，无外部依赖（除 socket 和 helper）
 """
 import threading
 import socket
-from typing import Literal
+from typing import Literal, Optional
 from logging import getLogger
 
 from .helper import recv_frame
@@ -37,22 +37,25 @@ class Sock:
 class SocketManager:
     """server socket 生命周期 + 连接表路由 + 重连，不加锁"""
 
-    def __init__(self, sock_type: type[Sock] | None = None):
+    def __init__(self, sock_type: Optional[type[Sock]] = None):
         self._port = 0
-        self._timeout = 0
+        self._accept_timeout = 0.0
+        self._recv_timeout = 0.0
         self._ip_table: dict[str, Sock] = {}
-        self._current_ip: str | None = None
-        self._sock: socket.socket | None = None
+        self._current_ip: Optional[str] = None
+        self._sock: Optional[socket.socket] = None
         self._sock_type = sock_type or Sock
 
     # --- 生命周期 ---
 
-    def start(self, ip: str, port: int, listen_count: int, timeout: float) -> None:
+    def start(self, ip: str, port: int, listen_count: int,
+              accept_timeout: float, recv_timeout: float) -> None:
         self._port = port
-        self._timeout = timeout
+        self._accept_timeout = accept_timeout
+        self._recv_timeout = recv_timeout
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(self._timeout)
+        sock.settimeout(self._accept_timeout)
         sock.bind((ip, port))
         sock.listen(listen_count)
         self._sock = sock
@@ -86,7 +89,7 @@ class SocketManager:
             raise ConnectionError(f"ECU {ip} 未连接，当前连接表:{list(self._ip_table.keys())}")
         self._current_ip = ip
 
-    def current(self) -> str | None:
+    def current(self) -> Optional[str]:
         return self._current_ip
 
     # --- 数据路由 ---
@@ -118,13 +121,13 @@ class SocketManager:
         try:
             sock, addr = self._sock.accept()
         finally:
-            self._sock.settimeout(self._timeout)
+            self._sock.settimeout(self._accept_timeout)
 
         if addr[0] != ip:
             sock.close()
             raise ConnectionError(f"重连失败：收到 {addr[0]} 而非 {ip}")
 
-        sock.settimeout(self._timeout)
+        sock.settimeout(self._recv_timeout)
         self._ip_table[ip] = self._sock_type(sock)
         logger.info("ECU %s 重连成功", ip)
 
@@ -143,7 +146,7 @@ class SocketManager:
             except TimeoutError:
                 logger.debug('超时退出')
                 break
-            sock.settimeout(self._timeout)
+            sock.settimeout(self._recv_timeout)
             ip, port = addr
             old = self._ip_table.get(ip)
             if old:
@@ -219,21 +222,27 @@ class DoIPEndpoint:
 
     def __init__(self,
                  ip: str, port: int, tester: int,
-                 timeout: float, listen_count: int,
+                 accept_timeout: float, recv_timeout: float,
+                 reconnect_timeout: float, listen_count: int,
                  version: int, msg_type: int, byte_order: Literal['little', 'big'],
-                 sock_type: type[Sock] | None = None):
+                 sock_type: Optional[type[Sock]] = None):
         self._ip = ip
         self._port = port
         self._tester = tester
-        self._timeout = timeout
+        self._accept_timeout = accept_timeout
+        self._recv_timeout = recv_timeout
+        self._reconnect_timeout = reconnect_timeout
         self._listen_count = listen_count
-        self._ecu: int | None = None
+        self._ecu: Optional[int] = None
         self._lock = threading.Lock()
         self._manager = SocketManager(sock_type)
         self._protocol = Protocol(version, msg_type, byte_order)
 
     def start(self) -> None:
-        self._manager.start(self._ip, self._port, self._listen_count, self._timeout)
+        self._manager.start(
+            self._ip, self._port, self._listen_count,
+            self._accept_timeout, self._recv_timeout,
+        )
 
     def stop(self) -> None:
         self._manager.stop()
@@ -258,7 +267,7 @@ class DoIPEndpoint:
                 response = self._manager.recv()
             except (ConnectionError, TimeoutError, OSError) as e:
                 logger.warning('DoIP 通信失败，触发重连: %s', e)
-                self._manager.reconnect(timeout=5.0)
+                self._manager.reconnect(timeout=self._reconnect_timeout)
                 self._manager.send(frame)
 
                 try:

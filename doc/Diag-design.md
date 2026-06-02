@@ -8,17 +8,24 @@
 
 ```
 src/workspace/module/Diag/
-├── __init__.py       # 导出 Session, Service, UdsResponse
-├── __main__.py       # 使用演示 / 调试入口
-├── uds.py            # UDS 层：KeepAlive + Session
-├── service.py        # 业务层：Service(Session)，高层诊断操作
-├── doip.py           # DoIP 层：Sock → SocketManager → Protocol → DoIPEndpoint
-├── helper.py         # 工具函数：收帧、类型转换、PIN Code、Key 计算
-├── response.py       # UdsResponse 数据类：正/负响应解析
-└── errors.py         # 自定义异常：DoIpProtocolError
+├── __init__.py              # 导出 Session, Service, UdsResponse
+├── __main__.py              # 使用演示（从 connections.yaml 加载配置）
+├── uds.py                   # UDS 层：KeepAlive + Session
+├── service.py               # 业务层：Service(Session)，高层诊断操作
+├── doip.py                  # DoIP 层：Sock → SocketManager → Protocol → DoIPEndpoint
+├── helper.py                # 工具函数：收帧、类型转换
+├── response.py              # UdsResponse 数据类：正/负响应解析
+├── errors.py                # 自定义异常：DoIpProtocolError
+└── config/
+    ├── __init__.py           # 配置包
+    ├── loader.py             # YAML 配置加载器（PIN Code + 连接配置）
+    ├── secrets.yaml          # 🔴 PIN Code 查找表（GITIGNORED）
+    ├── secrets.example.yaml  # 密钥模板（提交）
+    ├── connections.yaml      # 🟠 IP/ECU/平台连接配置（GITIGNORED）
+    └── connections.example.yaml  # 连接配置模板（提交）
 ```
 
-**核心模型**：一个 `Session` 持有一个 `DoIPEndpoint` + 一个 `KeepAlive`。用户通过 `Service(Session)` 获得高层诊断方法（`change_session`、`change_level`、`read_did` 等）。IO 串行化由 `DoIPEndpoint` 内部 `threading.Lock` 保证。
+**核心模型**：一个 `Session` 持有一个 `DoIPEndpoint` + 一个 `KeepAlive`。用户通过 `Service(Session)` 获得高层诊断方法。IO 串行化由 `DoIPEndpoint` 内部 `threading.Lock` 保证。
 
 ---
 
@@ -38,8 +45,12 @@ src/workspace/module/Diag/
 │  Sock (doip.py)                    │  ← 单 socket 封装
 ├────────────────────────────────────┤
 │  UdsResponse (response.py)         │  ← 响应解析：正/负响应、字段提取、NRC 描述
-│  helper.py                         │  ← 工具：recv_frame、to_bytes、calculate_key、get_pin_code
+│  helper.py                         │  ← 工具：recv_frame、to_bytes
 │  errors.py                         │  ← DoIpProtocolError
+├────────────────────────────────────┤
+│  config/loader.py                  │  ← 配置加载：YAML → 扁平字典
+│  config/secrets.yaml               │  ← 🔴 密钥文件（gitignored）
+│  config/connections.yaml           │  ← 🟠 连接文件（gitignored）
 └────────────────────────────────────┘
 ```
 
@@ -52,12 +63,9 @@ src/workspace/module/Diag/
 ```python
 class Sock:
     def __init__(self, sock: socket.socket)
-
-        def send(self, msg: bytes) -> None
-
-        def recv(self) -> bytes
-
-        def close(self) -> None
+    def send(self, msg: bytes) -> None
+    def recv(self) -> bytes
+    def close(self) -> None
 ```
 
 单 socket 封装，`recv()` 调用 `helper.recv_frame()` 完成 DoIP 帧的粘包/拆包。
@@ -67,37 +75,26 @@ class Sock:
 ```python
 class SocketManager:
     def __init__(self, sock_type: type[Sock] | None = None)
-
-        def start(self, ip, port, listen_count, timeout) -> None
-
-        def stop(self) -> None
-
-        def connections(self) -> list[str]
-
-        def select(self, ip: str) -> None
-
-        def current(self) -> str | None
-
-        def send(self, data: bytes) -> None
-
-        def recv(self) -> bytes
-
-        def reconnect(self, timeout: float) -> None
+    def start(self, ip, port, listen_count, accept_timeout, recv_timeout) -> None
+    def stop(self) -> None
+    def connections(self) -> list[str]
+    def select(self, ip: str) -> None
+    def current(self) -> str | None
+    def send(self, data: bytes) -> None
+    def recv(self) -> bytes
+    def reconnect(self, timeout: float) -> None
 ```
 
-自身不加锁，由 `DoIPEndpoint` 保证单线程访问。`start()` 时进入单次 accept 循环收集初始连接，之后通过 `select(ip)` 切换当前通信目标。
+自身不加锁，由 `DoIPEndpoint` 保证单线程访问。`start()` 时使用 `accept_timeout` 收集初始连接；每个 client socket 使用 `recv_timeout` 等待 UDS 响应。`reconnect` 可传入独立超时。
 
 ### Protocol
 
 ```python
 class Protocol:
     ERROR = DoIpProtocolError
-
     def __init__(self, version: int, msg_type: int, byte_order: 'little' | 'big')
-
-        def encode(self, uds: bytes, tester: int, ecu: int) -> bytes
-
-        def decode(self, frame: bytes, tester: int, ecu: int) -> bytes
+    def encode(self, uds: bytes, tester: int, ecu: int) -> bytes
+    def decode(self, frame: bytes, tester: int, ecu: int) -> bytes
 ```
 
 纯编解码，无状态。`tester` / `ecu` 每次调用传入。decode 时校验版本反码、Payload Type、长度、源/目标地址。
@@ -106,21 +103,17 @@ class Protocol:
 
 ```python
 class DoIPEndpoint:
-    def __init__(self, ip, port, tester, timeout, listen_count,
-                 version, msg_type, byte_order, sock_type=None)
-
-        def start(self) -> None
-
-        def stop(self) -> None
-
-        def connections(self) -> list[str]
-
-        def select(self, ip: str, ecu: int) -> None
-
-        def send(self, uds: bytes) -> bytes  # encode → 加锁 IO → decode；失败自动重连
+    def __init__(self, ip, port, tester, accept_timeout, recv_timeout,
+                 reconnect_timeout, listen_count, version, msg_type,
+                 byte_order, sock_type=None)
+    def start(self) -> None
+    def stop(self) -> None
+    def connections(self) -> list[str]
+    def select(self, ip: str, ecu: int) -> None
+    def send(self, uds: bytes) -> bytes   # encode → 加锁 IO → decode；失败自动重连
 ```
 
-`send(uds: bytes) -> bytes` 是唯一的 IO 原语。内部持有 `threading.Lock`，通信失败时自动触发一次重连。
+`send(uds: bytes) -> bytes` 是唯一的 IO 原语。内部持有 `threading.Lock`，通信失败时使用 `reconnect_timeout` 自动重连（不再硬编码 5.0）。
 
 ---
 
@@ -131,10 +124,8 @@ class DoIPEndpoint:
 ```python
 class KeepAlive:
     def __init__(self, fn: Callable[[bytes], bytes], interval: float, payload: bytes)
-
-        def start(self) -> None
-
-        def stop(self) -> None
+    def start(self) -> None
+    def stop(self) -> None
 ```
 
 后台守护线程，定时发送 TesterPresent（默认 `0x3E 0x00`）。发送失败时自动停止。
@@ -146,81 +137,136 @@ class Session:
     def __init__(self,
                  ip: str,
                  ecus: dict[str, tuple[str, int]],
-                 port: int = 13400,
-                 tester: int = 0x0E80,
-                 timeout: float = 1,
-                 listen_count: int = 10,
-                 doip_version: int = 0x02,
-                 doip_msg_type: int = 0x8001,
-                 byte_order: 'little' | 'big' = 'big',
-                 keepalive_interval: float = 0.5,
-                 keepalive_payload: bytes = b'\x3E\x00')
+                 doip: DoIPConfig | None = None,
+                 keepalive: KeepAliveConfig | None = None)
 
     # 上下文管理器
     def __enter__() -> Self
-
-        def __exit__(exc_type, exc_val, exc_tb) -> None
+    def __exit__(exc_type, exc_val, exc_tb) -> None
 
     # 运算符
     def __rshift__(self, uds: Any) -> Any  # session >> "22DC06"
 
     # 属性
-    @property
-
-    ecus -> MappingProxyType
+    @property ecus -> MappingProxyType
 
     # 公开方法
     def start(self) -> bool
-
-        def stop(self) -> bool
-
-        def on(self, name: str) -> Self  # 切换 ECU
-
-        def send(self, data: str) -> UdsResponse  # 发送 UDS 请求，返回 UdsResponse
+    def stop(self) -> bool
+    def on(self, name: str) -> Self          # 切换 ECU
+    def send(self, data: str) -> UdsResponse # 发送 UDS 请求
 ```
 
 **数据流**：`send(data: str)` → `_pre_send`（hex 字符串 → bytes）→ `endpoint.send(payload)` → `_post_receive`（bytes → UdsResponse）
 
 ---
 
+## 配置对象 (config dataclasses)
+
+为解决 `Session`/`Service` 参数膨胀问题（当前 ~14 个），将相关参数收敛到三个 dataclass 中。所有参数只在入口处定义默认值。
+
+```python
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class DoIPConfig:
+    """DoIP 传输层配置"""
+    port: int = 13400
+    tester: int = 0x0E80
+    accept_timeout: float = 1.5      # 初始 accept 等待 ECU 连接
+    recv_timeout: float = 3.0        # 客户端 socket recv 等待 UDS 响应（需比 accept 长）
+    reconnect_timeout: float = 5.0   # 断连后重建连接的 accept 等待
+    listen_count: int = 10
+    version: int = 0x02
+    msg_type: int = 0x8001
+    byte_order: Literal['little', 'big'] = 'big'
+
+@dataclass
+class KeepAliveConfig:
+    """TesterPresent 保活配置"""
+    interval: float = 1.5
+    payload: bytes = b'\x3E\x00'
+
+@dataclass
+class RetryConfig:
+    """send_until 重试策略（ISO 14229 NRC 0x78 标准）"""
+    count: int = 3
+    delay: float = 0.5
+```
+
+**设计原则**：
+- 三个入口参数集各管一摊：`DoIPConfig`（传输层）、`KeepAliveConfig`（心跳）、`RetryConfig`（应用层重试）
+- 每个参数**只在 config 对象中定义一次默认值**，Session/Service 不再重复
+- `DoIPConfig` 中三个 timeout 拆分：`accept_timeout`（短，连接快）、`recv_timeout`（长，复杂 UDS 操作需数秒）、`reconnect_timeout`（替换原硬编码 5.0）
+- 命名去掉冗余前缀：`doip_version` → `version`，`keepalive_interval` → `interval`
+
+---
+
 ## 业务层 (service.py)
 
-`Service` 继承 `Session`，在其基础上提供高层诊断操作：
+`Service` 继承 `Session`，在其基础上提供 UDS 标准诊断操作。
 
 ```python
 class Service(Session):
-    def __init__(self, ip, ecus, platform, serial_version=2.0, soc_num=1, **kwargs)
+    def __init__(self, ip=None, ecus=None,
+                 doip: DoIPConfig | None = None,
+                 keepalive: KeepAliveConfig | None = None,
+                 retry: RetryConfig | None = None,
+                 **kwargs)
 
     # 会话 / 安全等级
     def change_session(self, ss_id: int) -> Tuple[bool, UdsResponse]
-
-        def change_level(self, level: 'L1' | 'L5' | 'L19') -> Tuple[bool, UdsResponse]
-
-        def change_any(self, ss_id=None, level=None) -> bool
+    def change_level(self, level: int) -> Tuple[bool, UdsResponse]  # L 奇数 0x01~0xFD
+    def change_any(self, ss_id=None, level=None) -> bool
 
     # ECU 控制
     def reset(self, reset_type=0x01) -> bool
 
-        def unlock_ssh(self) -> bool
-
     # 数据读写
-    def read_data_by_identifier(self, did, ss_id=None, level=None) -> UdsResponse
-
-        def read_did(self, did, ss_id=None, level=None) -> UdsResponse
-
-        def write_data_by_identifier(self, did, data, ss_id=None, level=None) -> UdsResponse
-
-        def write_did(self, did, data, ss_id=None, level=None) -> UdsResponse
+    def read_did(self, did, ss_id=None, level=None) -> UdsResponse
+    def write_did(self, did, data, ss_id=None, level=None) -> UdsResponse
 
     # 例程控制
     def start_routine(self, routine_id, data=None, ss_id=None, level=None) -> UdsResponse
-
-        def stop_routine(self, routine_id) -> bool
-
-        def get_routine_result(self, routine_id=None) -> UdsResponse
+    def stop_routine(self, routine_id) -> bool
+    def get_routine_result(self, routine_id=None) -> UdsResponse
 
     # 内部辅助
-    def send_until(self, data, count=3, retry_delay=0.5) -> UdsResponse
+    def send_until(self, data, count=None, retry_delay=None) -> UdsResponse
+```
+
+- `ip`/`ecus` 可选，缺省从 `connections.yaml` 加载
+- `level` 接收纯 `int`，L 奇数 `0x01`~`0xFD`（ISO 14229 行业惯例）
+- `send_until` 自身参数缺省时使用实例 `RetryConfig` 默认值
+- `platform`/`serial_version`/`soc_num` 已删除
+- `unlock_ssh` 已删除 — 非 UDS 协议方法
+
+### 参数收敛对比
+
+| | 改造前 | 改造后 |
+|------|--------|--------|
+| Session 参数 | 11 个 | **4 个** (ip, ecus, doip, keepalive) |
+| Service 参数 | 14 个（含 7 个透传重复） | **5 个** (ip, ecus, doip, keepalive, retry) |
+| 默认值定义位置 | Session + Service 各一份（冲突：timeout 1 vs 1.5） | 各 Config 类唯一一份 |
+
+### 使用方式
+
+```python
+# 全默认
+ss = Service()
+ss.start()
+
+# 单项覆盖
+ss = Service(doip=DoIPConfig(timeout=3.0))
+ss = Service(retry=RetryConfig(count=5, delay=1.0))
+
+# 完整自定义
+ss = Service(
+    doip=DoIPConfig(port=20000, tester=0x1234, byte_order='little'),
+    keepalive=KeepAliveConfig(interval=2.0),
+    retry=RetryConfig(count=5, delay=1.0),
+)
 ```
 
 **安全等级切换流程** (`change_level`)：
@@ -228,11 +274,11 @@ class Service(Session):
 ```
 请求 Seed (27 {level})
   → 收到 Seed
-    → 查表获取 PIN Code（get_pin_code）
-      → 计算 Key（calculate_key）
-        → 发送 Key (27 {level+1} {key})
-          → 验证通过
+    → 调用注入的 key_calculator(level, seed) → key
+      → 发送 Key (27 {level+1} {key})
+        → 验证通过
 ```
+> `key_calculator` 由外部注入（`Service.set_key_calculator(fn)`），内部自行管理 PIN 查找 + 算法选择。
 
 ---
 
@@ -241,29 +287,27 @@ class Service(Session):
 ```python
 @dataclass
 class UdsResponse:
-    raw: bytes  # 原始字节
-    ok: bool  # 正响应为 True
-    is_negative: bool  # 负响应为 True
+    raw: bytes              # 原始字节
+    ok: bool                # 正响应为 True
+    is_negative: bool       # 负响应为 True
 
     # 正响应字段
-    sid: int | None  # 正响应 SID = 请求 SID + 0x40
-    head: bytes | None  # 固定头部（DID、子功能等）
-    body: bytes | None  # 可变数据负载
+    sid: int | None         # 正响应 SID = 请求 SID + 0x40
+    head: bytes | None      # 固定头部（DID、子功能等）
+    body: bytes | None      # 可变数据负载
 
     # 负响应字段
     request_sid: int | None
     nrc: int | None
-    nrc_desc: str | None  # 中文 NRC 描述
+    nrc_desc: str | None    # 中文 NRC 描述
 
     # 方法
     def check_fail(sid=None, head=None, body=None) -> bool
-
-        @classmethod
-        def from_bytes(data: bytes) -> Self
+    @classmethod 
+    def from_bytes(data: bytes) -> Self
 ```
 
 内置两张静态映射表：
-
 - `_NRC_DESC`：NRC → 中文描述（~30 条）
 - `_POSITIVE_HEAD_LEN`：正响应 SID → head 字节长度（~20 条）
 
@@ -271,296 +315,211 @@ class UdsResponse:
 
 ## 工具函数 (helper.py)
 
-| 函数                                              | 用途                                             |
-|-------------------------------------------------|------------------------------------------------|
-| `recv_exact(sock, size)`                        | 精确收取指定字节数                                      |
-| `recv_frame(sock)`                              | 收完整 DoIP 帧（8 字节头 + N 字节载荷）                     |
-| `to_bytes(value)`                               | 统一类型 → bytes（支持 bytes/str/int/None）            |
-| `calculate_key(level, seed, pin_code)`          | Seed/Key 安全访问算法（3 字节 seed 走自定义算法，其他走 AES-CMAC） |
-| `get_pin_code(level, platform, serial_version)` | **PIN Code 查找表**（详见下方硬编码审计）                    |
+| 函数 | 用途 |
+|------|------|
+| `recv_exact(sock, size)` | 精确收取指定字节数 |
+| `recv_frame(sock)` | 收完整 DoIP 帧（8 字节头 + N 字节载荷） |
+| `to_bytes(value, byte_order='big')` | 统一类型 → bytes（bytes/str/int/None）。int 转换时使用指定字节序 |
+
+`Session` 持有的 `_byte_order` 可传入 `to_bytes`，保证 int→bytes 与 DoIP 帧编码一致。
 
 ---
 
-## 🔴 硬编码审计
+## 配置系统 (config/)
 
-### 1. 密码学密钥 — `helper.py:94-122` `get_pin_code()`
+### .gitignore 策略
 
-PIN Code 查找表包含多个真实整车平台的 ECU 安全访问密钥：
-
-| 等级  | 平台                             | PIN Code                           | 风险      |
-|-----|--------------------------------|------------------------------------|---------|
-| L1  | `P_30TU`, `P_G30TU`, `P_EEA40` | `FFFF…` (32×F)                     | 🔴 真实密钥 |
-| L1  | `P_20_25_25S`                  | `FFFFFFFFFF` (10×F)                | 🔴 真实密钥 |
-| L5  | `P_30TU`                       | `E853ECE43ABA6A39CB6CC221FC88B223` | 🔴 真实密钥 |
-| L5  | `P_G30TU`, `P_EEA40`           | `51902E1AD902AF40119486A8DFA71708` | 🔴 真实密钥 |
-| L5  | `P_20_25_25S` v2.0             | `FE63C818C2`                       | 🔴 真实密钥 |
-| L5  | `P_20_25_25S` v2.5             | `7C9143F1BA`                       | 🔴 真实密钥 |
-| L19 | 全部平台                           | `FFFF…`                            | 🔴 真实密钥 |
-
-> ⚠️ **这些密钥已提交到 git 历史中。** 拥有密钥 + 网络接入即可对 ECU 执行任意诊断操作。
-
-### 2. 连接 / 拓扑信息 — `__main__.py:26-28`
-
-```python
-Service(ip='198.18.44.1', platform='P_G30TU', ecus={
-    'mcu': ('198.18.44.49', 0x1301),
-    'soc': ('198.18.44.52', 0x1304),
-})
+```
+src/workspace/module/Diag/config/*.yaml           ← 忽略所有 .yaml
+!src/workspace/module/Diag/config/*.example.yaml  ← 但保留模板
 ```
 
-- IP 地址暴露测试台架/车辆网络拓扑
-- ECU 逻辑地址暴露车内节点分配
-- 平台字符串暴露目标车型
+| 文件 | Git | 内容 |
+|------|-----|------|
+| `secrets.yaml` | ❌ ignore | PIN Code 查找表，含真实密钥 |
+| `secrets.example.yaml` | ✅ commit | 同结构，值全部为 `<PLACEHOLDER>` |
+| `connections.yaml` | ❌ ignore | IP、ECU 地址、平台名 |
+| `connections.example.yaml` | ✅ commit | 示例结构 + 假数据 |
+| `loader.py` | ✅ commit | 加载 / 解析 / 校验逻辑 |
 
-### 3. 默认构造参数 — `uds.py:64` / `service.py:20`
+### loader.py 接口
 
-| 参数                  | 默认值           | 敏感度         |
-|---------------------|---------------|-------------|
-| `tester`            | `0x0E80`      | 🟡 诊断仪身份    |
-| `port`              | `13400`       | 🟢 ISO 标准端口 |
-| `doip_version`      | `0x02`        | 🟢 ISO 标准   |
-| `doip_msg_type`     | `0x8001`      | 🟢 ISO 标准   |
-| `keepalive_payload` | `b'\x3E\x00'` | 🟢 UDS 标准   |
+```python
+# 连接配置
+load_connections() -> dict      # 原始 YAML 字典
+get_defaults() -> dict          # defaults 段
+get_ecus() -> dict[str, tuple[str, int]]  # {name: (ip, logical_addr)}
+```
 
 ---
 
-## 🏗️ 重构方案：YAML 配置文件 + .gitignore
+## 🔴 硬编码审计（已处置）
 
-### 目标
+### 1. 密码学密钥 — 已从代码中分离
 
-将敏感硬编码值从 Python 源码中分离到配置文件，配置文件 gitignore，模板文件提交。
+- **处置**：已拆分到 `config/secrets.yaml`（gitignored）
+- `get_pin_code` 将在公共化拆分时删除，其逻辑下沉到外部 `key_calculator`
+- **Git 历史**：经核查，密钥从未进入任何 commit（仅在工作区存在过）
 
-### 新增文件结构
+### 2. 连接 / 拓扑信息 — 已分离
 
-```
-src/workspace/module/Diag/
-├── config/
-│   ├── secrets.yaml              ← 🔴 密钥（GITIGNORED）
-│   ├── secrets.yaml.example      ← 🔴 密钥模板，占位符填充（提交）
-│   ├── connections.yaml          ← 🟠 连接配置（GITIGNORED）
-│   ├── connections.yaml.example  ← 🟠 连接配置模板（提交）
-│   └── loader.py                 ← 配置加载器（提交）
-```
+- **处置**：已拆分到 `config/connections.yaml`（gitignored）
+- `Service()` 支持无参构造，自动从配置文件加载
+- `__main__.py` 已清理硬编码和调试注释
 
-### 各文件职责
+### 3. 协议常量 — 保留在代码中
 
-| 文件                         | Git      | 内容                       |
-|----------------------------|----------|--------------------------|
-| `secrets.yaml`             | ❌ ignore | PIN Code 查找表，含真实密钥       |
-| `secrets.yaml.example`     | ✅ commit | 同结构，值全部为 `<PLACEHOLDER>` |
-| `connections.yaml`         | ❌ ignore | IP、ECU 地址、平台名            |
-| `connections.yaml.example` | ✅ commit | 示例结构 + 假数据               |
-| `loader.py`                | ✅ commit | 加载 / 解析 / 校验逻辑           |
+`tester=0x0E80`, `port=13400`, `doip_version=0x02` 等均为 ISO 标准值，可安全保留。
 
-### secrets.yaml 结构设计
+---
 
-```yaml
-# ⚠️ 此文件包含 ECU 安全访问密钥，绝对不能提交到 git
-# 复制 secrets.example.yaml 并填入真实值
+## 🏗️ 公共化拆分方案（待实施）
 
-pin_codes:
-  - level: 1
-    entries:
-      - pin: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
-        platforms: [ P_30TU, P_G30TU, P_EEA40 ]
-      - pin: "FFFFFFFFFF"
-        platforms: [ P_20_25_25S ]
+当前模块混合了通用 DoIP/UDS 协议实现和公司专有逻辑。核心思路：**专有部分变成可注入的回调**，公共库不关心 PIN Code 从哪来、Key 怎么算。
 
-  - level: 5
-    entries:
-      - pin: "E853ECE43ABA6A39CB6CC221FC88B223"
-        platforms: [ P_30TU ]
-      - pin: "51902E1AD902AF40119486A8DFA71708"
-        platforms: [ P_G30TU, P_EEA40 ]
-      - pin: "FE63C818C2"
-        platforms: [ P_20_25_25S ]
-        serial_version: 2.0
-      - pin: "7C9143F1BA"
-        platforms: [ P_20_25_25S ]
-        serial_version: 2.5
+### 关键设计：`key_calculator` 回调注入（必须实现）
 
-  - level: 19
-    entries:
-      - pin: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
-        platforms: [ P_30TU, P_G30TU, P_EEA40 ]
-      - pin: "FFFFFFFFFF"
-        platforms: [ P_20_25_25S ]
-```
+`calculate_key` 和 `get_pin_code` 从模块中**全部删除**。Key 计算完全由外部实现并注入。`change_level` 在调用时检查 `_key_calculator` 是否已设置，未注入则报错。
 
-### connections.yaml 结构设计
+回调签名：`(level: int, seed: bytes) -> bytes`。内部自行管理 PIN 查找和算法。
 
-```yaml
-# 连接 / 拓扑配置
-defaults:
-  ip: "198.18.44.1"
-  port: 13400
-  tester: 0x0E80
-  platform: "P_G30TU"
-  serial_version: 2.0
-
-ecus:
-  mcu:
-    ip: "198.18.44.49"
-    logical_addr: 0x1301
-  soc:
-    ip: "198.18.44.52"
-    logical_addr: 0x1304
-```
-
-### loader.py 接口设计
+### 注入点：`__init__.py` 暴露
 
 ```python
-# config/loader.py
+# __init__.py
 
-from dataclasses import dataclass
-from typing import Optional
-import yaml  # 或 json（标准库零依赖）
+from .uds import Session
+from .service import Service
+from .service import DoIPConfig, KeepAliveConfig, RetryConfig
 
+# Service 暴露 setter，让外部注入 key 计算逻辑
+Service.set_key_calculator = lambda self, fn: setattr(self, '_key_calculator', fn)
 
-@dataclass
-class PinEntry:
-    pin: str
-    platforms: list[str]
-    serial_version: Optional[float] = None
-
-
-@dataclass
-class PinCodeConfig:
-    entries: dict[tuple[int, str, Optional[float]], str]  # (level, platform, version) → pin
-
-
-@dataclass
-class ConnectionConfig:
-    ip: str
-    port: int
-    tester: int
-    platform: str
-    serial_version: float
-    ecus: dict[str, dict]
-
-
-def load_pin_codes(path: str = "config/secrets.yaml") -> PinCodeConfig:
-    """加载 PIN Code 配置，文件不存在时给出清晰错误提示"""
-    ...
-
-
-def load_connections(path: str = "config/connections.yaml") -> ConnectionConfig:
-    """加载连接配置"""
-    ...
+__all__ = ['Session', 'Service', 'UdsResponse',
+           'DoIPConfig', 'KeepAliveConfig', 'RetryConfig']
 ```
 
-### .gitignore 追加
+### 目标结构
 
-```gitignore
-# Diag 模块 — 敏感配置文件
-src/workspace/module/Diag/config/secrets.yaml
-src/workspace/module/Diag/config/connections.yaml
+```
+diag/                              ← pip install diag (公共库)
+├── __init__.py                    ← 导出 Session, Service
+├── errors.py                      ← DoIpProtocolError
+├── doip.py                        ← Sock, SocketManager, Protocol, DoIPEndpoint
+├── response.py                    ← UdsResponse
+├── uds.py                         ← Session, KeepAlive
+├── service.py                     ← Service + 通用 UDS 方法，key_calculator 可注入
+└── helper.py                      ← recv_exact, recv_frame, to_bytes
 
-# 以防用户直接放在模块根目录
-src/workspace/module/Diag/secrets.yaml
-src/workspace/module/Diag/connections.yaml
+oem/                               ← 公司私有包（内部仓库 / 无仓库）
+├── keys.py                        ← 实现 key_calculator(level, seed) → bytes
+│                                    内部自行管理 PIN Code 查找 + 算法实现
+├── platform.py                    ← unlock_ssh + 其他专有方法
+└── config/
+    ├── secrets.yaml               ← gitignored
+    └── connections.yaml           ← gitignored
 ```
 
-### 改造后的 get_pin_code
+### 通用 vs 专有分类
+
+| 组件 | 归属 | 处置 |
+|------|------|------|
+| `doip.py` 全部、`response.py` 全部、`errors.py` | ✅ 公共 | 直接保留 |
+| `uds.py` Session / KeepAlive | ✅ 公共 | 直接保留 |
+| `helper.py` recv_exact / recv_frame / to_bytes | ✅ 公共 | 直接保留 |
+| `helper.py` calculate_key / get_pin_code | 🔴 专有 | **删除**，完全由外部 key_calculator 实现 |
+| `service.py` change_session / reset / read/write_did / routine | ✅ 公共 | 直接保留 |
+| `service.py` send_until | ✅ 公共 | 直接保留 |
+| `service.py` change_level | 🟡 混合 | 改为调用注入的 `_key_calculator(level, seed)` |
+| `service.py` unlock_ssh | 🔴 专有 | **删除**，非 UDS 协议，OEM 私有 DID 操作 |
+| `config/loader.py` + YAML 配置 | 🔴 专有 | → `oem/config/` |
+
+### change_level 改造后
 
 ```python
-# helper.py 改造后
-
-from .config.loader import load_pin_codes
-
-_pin_cache: dict | None = None
-
-
-def get_pin_code(level: int, platform: str, serial_version: float = 2.0) -> str:
-    global _pin_cache
-    if _pin_cache is None:
-        _pin_cache = load_pin_codes()
-
-    # 精确匹配 (level, platform, version)
-    key = (level, platform, serial_version)
-    if key in _pin_cache:
-        return _pin_cache[key]
-
-    # 回退 (level, platform)
-    key = (level, platform)
-    if key in _pin_cache:
-        return _pin_cache[key]
-
-    raise ValueError(f'无 pin code 配置：level={level}, platform={platform}')
-```
-
-### Service 构造改造
-
-```python
-# service.py 改造后
+# service.py
 
 class Service(Session):
-    def __init__(self, ip=None, ecus=None, platform=None, ...):
-        # 如果未显式传入，从配置文件加载
-        conn = load_connections()
-        ip = ip or conn.ip
-        ecus = ecus or {
-            name: (info['ip'], info['logical_addr'])
-            for name, info in conn.ecus.items()
-        }
-        platform = platform or conn.platform
+    def __init__(self, ..., retry: RetryConfig | None = None):
         ...
+        self._key_calculator: Callable[[int, bytes], bytes] | None = None
+        self._retry = retry or RetryConfig()
+
+    def set_key_calculator(self, fn: Callable[[int, bytes], bytes]):
+        """注入 Key 计算回调。fn(level, seed) -> key_bytes。必须调用。"""
+        self._key_calculator = fn
+
+    def change_level(self, level: int) -> Tuple[bool, UdsResponse]:
+        # 校验：L 奇数，范围 0x01~0xFD（ISO 14229 行业惯例）
+        if not (0x01 <= level <= 0xFD and level % 2 == 1):
+            raise ValueError(
+                f"安全等级必须为 L 奇数 (0x01~0xFD)，收到: 0x{level:02X}"
+            )
+
+        if self._key_calculator is None:
+            raise RuntimeError(
+                "key_calculator 未注入。"
+                "请先调用 service.set_key_calculator(fn)，"
+                "fn(level: int, seed: bytes) -> bytes 负责 PIN 查找和 Key 计算。"
+            )
+
+        resp = self.send_until(f'27 {level:02X}')
+        if resp.check_fail(0x67, level):
+            return False, resp
+
+        seed = to_bytes(resp.body)
+        key = self._key_calculator(level, seed)          # ← 唯一的调用点
+        resp = self.send_until(f'27 {level + 1:02X} {key.hex()}')
+        if resp.check_fail(0x67, level + 1):
+            return False, resp
+
+        return True, resp
+
+    def send_until(self, data, count=None, retry_delay=None):
+        count = count if count is not None else self._retry.count
+        retry_delay = retry_delay if retry_delay is not None else self._retry.delay
+        ...
+
+```
+
+### 外部使用
+
+```python
+from Diag import Service
+
+# ---- 调用者实现 key_calculator ----
+def my_key_calculator(level: int, seed: bytes) -> bytes:
+    # 内部自行管理：PIN Code 来源 + Key 算法
+    pin = my_pin_lookup(level)
+    return my_key_algorithm(level, seed, pin)
+
+# ---- 使用 ----
+ss = Service()
+ss.set_key_calculator(my_key_calculator)   # 必须注入
+ss.change_level(0x05)
 ```
 
 ---
 
-## ⚠️ 待解决问题（README 同步记录）
+## ⚠️ 待解决问题
 
-### 1. Git 历史泄露
-
-密钥已经存在于 git 提交历史中。即使从当前代码中移除，仍可通过 `git log -p` 回溯。
-
-**处置选项**：
-
-- **方案 A**：使用 `git filter-branch` / `BFG Repo-Cleaner` 清除历史（需 force push，全员重新 clone）
-- **方案 B**：若仓库尚未对外公开，暂缓处理；尽快轮换所有已泄露的 L5 密钥
-- **方案 C**：将仓库设为私有 + 轮换密钥（最小改动）
-
-> **建议**：先确认仓库可见范围。若公开/半公开，立即轮换密钥 + 清理历史；若仅个人使用，优先完成配置分离，后续再清理历史。
-
-### 2. `FFFF…` 密钥的真实性
-
-全真实
-
-### 3. `__main__.py` 调试代码
-
-文件中有大量被注释的调试/测试代码（~50 行），含平台名、DID、例程 ID 等。即使拆出配置，这些注释仍会泄露信息。
-
-直接删除
-
-### 4. 配置加载器依赖
-
-当前项目无 `pyyaml` 依赖。选项：
-
-- **`pyyaml`**：需添加到 `requirements.txt`，支持注释，用户体验好
-
-### 5. 配置文件查找路径
-
-`loader.py` 需要确定配置文件搜索顺序：
-
-模块所在 `config/` 目录（默认）
+无。所有专有逻辑已识别并规划删除/外部化。`to_bytes` 已支持 `byte_order` 参数，`Session._byte_order` 可传入。公共化实施后模块零专有代码、零外部依赖。
 
 ---
 
-## 实施步骤（建议顺序）
+## 实施步骤
 
-1. **创建 `config/` 目录结构**（`*.yaml`）
-2. **改造 `helper.py`** — `get_pin_code()` 从 loader 读取
-3. **改造 `service.py`** — 构造参数支持从配置文件读取默认值
-4. **改造 `__main__.py`** — 清理硬编码，改为从配置文件读取
-5. **更新 `.gitignore`**
-6. **清理 `__main__.py` 调试注释**
-7. **确认后轮换已泄露的密钥 + 清理 git 历史**
-
-## ⚠️ 待解决问题 — 5 个需要关注的议题：
-
-- Git 历史泄露及三种处置方案 全清理
-- FFFF… 密钥真实性待确认 真实
-- __main__.py 调试代码污染 删掉
-- 配置加载器依赖选择（YAML）
-- 配置文件搜索路径策略 默认 config 目录
+| # | 内容 | 状态 |
+|---|------|------|
+| 1 | 创建 `config/` 目录 + YAML 配置 + loader | ✅ 已完成 |
+| 2 | `__main__.py` 清理硬编码和调试注释 | ✅ 已完成 |
+| 3 | `.gitignore` 忽略 `*.yaml`，保留 `*.example.yaml` | ✅ 已完成 |
+| 4 | `service.py` — `change_level` 改为调用 `_key_calculator(level, seed)`，缺省报错 | ⬜ 待实施 |
+| 5 | `helper.py` — 删除 `get_pin_code` 和 `calculate_key` | ⬜ 待实施 |
+| 6 | `service.py` — 添加 `DoIPConfig`/`KeepAliveConfig`/`RetryConfig` dataclass | ⬜ 待实施 |
+| 7 | `Session` — 收拢 DoIP/KeepAlive 参数为 config 对象 | ⬜ 待实施 |
+| 8 | `Service` — 收拢 retry 参数为 config 对象，消除与 Session 的重复默认值 | ⬜ 待实施 |
+| 9 | `__init__.py` — 暴露 config 对象 + `Service.set_key_calculator()` | ⬜ 待实施 |
+| 10 | `service.py` — 删除 `platform`/`serial_version`/`soc_num`/`unlock_ssh` | ⬜ 待实施 |
+| 11 | `helper.py` — 删除 `get_pin_code`/`calculate_key`；`to_bytes` 添加 `byte_order` | ⬜ 待实施 |
+| 12 | OEM 包 — 实现 key_calculator（PIN 查找 + 算法，完全自主） | ⬜ 待实施 |

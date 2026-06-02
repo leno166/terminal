@@ -3,68 +3,94 @@
 @作者: 雷小鸥
 @日期: 2026/6/2 14:44
 @许可: MIT License
-@描述:
-@版本: Version 0.1
+@描述: Service 层 — 配置 dataclass + UDS 标准诊断操作
+@版本: Version 0.2
 """
 import time
+from dataclasses import dataclass
+from typing import Callable, Literal, Tuple, Optional
 
 from .uds import Session
 from .response import UdsResponse
-from .helper import to_bytes, get_pin_code, calculate_key
-from typing import Literal, Tuple, Optional
+from .helper import to_bytes
 
+
+# ================== 配置 dataclass ==================
+
+@dataclass
+class DoIPConfig:
+    """DoIP 传输层配置"""
+    port: int = 13400
+    tester: int = 0x0E80
+    accept_timeout: float = 1.5      # 初始 accept 等待 ECU 连接
+    recv_timeout: float = 3.0        # 客户端 socket recv 等待 UDS 响应
+    reconnect_timeout: float = 5.0   # 断连后重建连接的 accept 等待
+    listen_count: int = 10
+    version: int = 0x02
+    msg_type: int = 0x8001
+    byte_order: Literal['little', 'big'] = 'big'
+
+
+@dataclass
+class KeepAliveConfig:
+    """TesterPresent 保活配置"""
+    interval: float = 1.5
+    payload: bytes = b'\x3E\x00'
+
+
+@dataclass
+class RetryConfig:
+    """send_until 重试策略（ISO 14229 NRC 0x78 标准）"""
+    count: int = 3
+    delay: float = 0.5
+
+
+# ================== Service ==================
 
 class Service(Session):
-    def __init__(self, ip: Optional[str] = None,
-                 ecus: Optional[dict[str, tuple[str, int]]] = None,
-                 platform: Optional[str] = None,
-                 serial_version: float = 2.0, soc_num: int = 1,
-                 port: int = 13400, tester: int = 0x0E80,
-                 timeout: float = 1.5, listen_count: int = 10,
-                 doip_version: int = 0x02, doip_msg_type: int = 0x8001,
-                 byte_order: Literal['little', 'big'] = 'big',
-                 keepalive_interval: float = 1.5,
-                 keepalive_payload: bytes = b'\x3E\x00'):
-        # --- 从配置文件加载默认值 ---
-        try:
-            from .config.loader import get_defaults, get_ecus as _load_ecus
-        except ImportError:
-            from config.loader import get_defaults, get_ecus as _load_ecus
+    """UDS 标准诊断服务。继承 Session，提供 ISO 14229 协议方法。"""
 
-        cfg = get_defaults()
-        ip = ip or cfg.get('ip')
-        ecus = ecus or _load_ecus()
-        platform = platform or cfg.get('platform')
-
-        if not ip:
-            raise ValueError("ip 未提供且配置文件中未设置 defaults.ip")
-        if not ecus:
-            raise ValueError("ecus 未提供且配置文件中未设置 ecus 段")
-        if not platform:
-            raise ValueError("platform 未提供且配置文件中未设置 defaults.platform")
+    def __init__(self,
+                 ip: str,
+                 ecus: dict[str, tuple[str, int]],
+                 doip: Optional[DoIPConfig] = None,
+                 keepalive: Optional[KeepAliveConfig] = None,
+                 retry: Optional[RetryConfig] = None):
+        doip = doip or DoIPConfig()
+        keepalive = keepalive or KeepAliveConfig()
 
         super().__init__(
-            ip, ecus, port, tester, timeout, listen_count,
-            doip_version, doip_msg_type, byte_order,
-            keepalive_interval, keepalive_payload
+            ip=ip,
+            ecus=ecus,
+            doip=doip,
+            keepalive=keepalive,
         )
 
-        self._platform = platform
-        self._serial_version = serial_version or cfg.get('serial_version', 2.0)
-        self._soc_num = soc_num
+        self._retry = retry or RetryConfig()
 
-        self.session = 0x1
-        self.level: Literal['L1', 'L5', 'L19'] = 'L1'
-        self._level_table: dict[str, int] = {
-            'L1' : 0x01,
-            'L5' : 0x05,
-            'L19': 0x19,
-        }
+        # --- 状态 ---
+        self.session = 0x01
+        self.level: int = 0x01
+
+        # --- 可注入的回调 ---
+        self._key_calculator: Optional[Callable[[int, bytes], bytes]] = None
 
         # 用于记录最近启动的例程 ID（供 get_routine_result 使用）
-        self._current_routine_id: int | None = None
+        self._current_routine_id: Optional[int] = None
 
-    def send_until(self, data: str, count: int = 3, retry_delay: float = 0.5) -> UdsResponse:
+    # ================== 注入点 ==================
+
+    def set_key_calculator(self, fn: Callable[[int, bytes], bytes]) -> None:
+        """注入 Key 计算回调。fn(level, seed) -> key_bytes。必须调用。"""
+        self._key_calculator = fn
+
+    # ================== 内部辅助 ==================
+
+    def send_until(self, data: str, count: Optional[int] = None,
+                   retry_delay: Optional[float] = None) -> UdsResponse:
+        count = count if count is not None else self._retry.count
+        retry_delay = retry_delay if retry_delay is not None else self._retry.delay
+
         for attempt in range(count):
             resp = self.send(data)
 
@@ -76,11 +102,12 @@ class Service(Session):
 
         raise RuntimeError("请求重复失败，已达到最大重试次数")
 
+    # ================== UDS 标准服务 ==================
+
     def change_session(self, ss_id: int) -> Tuple[bool, UdsResponse]:
         """
         切换诊断会话（UDS 服务 0x10）
         :param ss_id: 会话类型，如 1=默认会话，2=编程会话，3=扩展会话等
-        :return: 成功返回 True，失败返回 False
         """
         resp = self.send_until(f"10 {ss_id:02X}")
 
@@ -90,74 +117,89 @@ class Service(Session):
         self.session = ss_id
         return True, resp
 
-    def change_level(self, level: Literal['L1', 'L5', 'L19']) -> Tuple[bool, UdsResponse]:
-        level_int = self._level_table.get(level, 0)
-        if not level_int:
-            raise ValueError(f'输入的等级错误')
-        resp = self.send_until(f'27 {level_int:02X}')
-        if resp.check_fail(0x67, level_int):
+    def change_level(self, level: int) -> Tuple[bool, UdsResponse]:
+        """
+        安全访问（UDS 服务 0x27）
+        :param level: L 奇数，范围 0x01~0xFD（ISO 14229 行业惯例）
+        """
+        if not (0x01 <= level <= 0xFD and level % 2 == 1):
+            raise ValueError(
+                f"安全等级必须为 L 奇数 (0x01~0xFD)，收到: 0x{level:02X}"
+            )
+
+        if self._key_calculator is None:
+            raise RuntimeError(
+                "key_calculator 未注入。"
+                "请先调用 service.set_key_calculator(fn)，"
+                "fn(level: int, seed: bytes) -> bytes 负责 PIN 查找和 Key 计算。"
+            )
+
+        resp = self.send_until(f'27 {level:02X}')
+        if resp.check_fail(0x67, level):
             return False, resp
 
         seed = to_bytes(resp.body)
-
-        pin_code = get_pin_code(level=level_int, platform=self._platform, serial_version=self._serial_version)
-
-        key = calculate_key(level=level_int, seed=seed, pin_code=pin_code)
-        resp = self.send_until(f'27 {level_int + 1:02X} {key.hex()}')
-        if resp.check_fail(0x67, level_int + 1):
+        key = self._key_calculator(level, seed)
+        resp = self.send_until(f'27 {level + 1:02X} {key.hex()}')
+        if resp.check_fail(0x67, level + 1):
             return False, resp
 
         self.level = level
         return True, resp
 
     def change_any(
-            self, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None,
+            self, ss_id: Optional[int] = None, level: Optional[int] = None,
     ) -> bool:
-        if ss_id:
+        if ss_id is not None:
             step_success, _ = self.change_session(ss_id)
             if not step_success:
                 return False
-        if level:
+        if level is not None:
             step_success, _ = self.change_level(level=level)
             if not step_success:
                 return False
         return True
 
-    def reset(self, reset_type: int = 0x01):
+    def reset(self, reset_type: int = 0x01) -> bool:
         """
         ECU 复位（UDS 服务 0x11）
         :param reset_type: 复位类型，0x01=硬复位，0x02=钥匙关/开复位，0x03=软复位等
-        :return: 成功返回 True，失败返回 False
         """
         resp = self.send_until(f"11 {reset_type:02X}")
         if resp.check_fail(sid=0x51, head=reset_type):
             return False
         return True
 
-    def read_data_by_identifier(self, did: int, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None) -> UdsResponse:
+    def read_data_by_identifier(self, did: int,
+                                ss_id: Optional[int] = None,
+                                level: Optional[int] = None) -> UdsResponse:
         self.change_any(ss_id, level)
-
         return self.send_until(f'22 {did:04X}')
 
-    def read_did(self, did: int, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None) -> UdsResponse:
+    def read_did(self, did: int,
+                 ss_id: Optional[int] = None,
+                 level: Optional[int] = None) -> UdsResponse:
         return self.read_data_by_identifier(did, ss_id, level)
 
-    def write_data_by_identifier(self, did: int, data: bytes, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None) -> UdsResponse:
+    def write_data_by_identifier(self, did: int, data: bytes,
+                                 ss_id: Optional[int] = None,
+                                 level: Optional[int] = None) -> UdsResponse:
         self.change_any(ss_id, level)
-
         return self.send_until(f'2E {did:04X} {data.hex()}')
 
-    def write_did(self, did: int, data: bytes, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None) -> UdsResponse:
+    def write_did(self, did: int, data: bytes,
+                  ss_id: Optional[int] = None,
+                  level: Optional[int] = None) -> UdsResponse:
         return self.write_data_by_identifier(did, data, ss_id, level)
 
-    def start_routine(self, routine_id: int, data: bytes | None = None, ss_id: int | None = None, level: Literal['L1', 'L5', 'L19'] | None = None) -> UdsResponse:
+    def start_routine(self, routine_id: int,
+                      data: Optional[bytes] = None,
+                      ss_id: Optional[int] = None,
+                      level: Optional[int] = None) -> UdsResponse:
         """
         启动例程（UDS 服务 0x31，子功能 0x01）
         :param routine_id: 例程标识符（2 字节）
         :param data:    可选的例程输入参数
-        :param ss_id:   可选，临时切换到的会话 ID
-        :param level:   可选，临时切换到的安全等级
-        :return:        响应对象（肯定响应为 0x71 + 子功能 0x01 + 例程 ID + 可选输出参数）
         """
         self.change_any(ss_id, level)
 
@@ -167,7 +209,6 @@ class Service(Session):
         req_str = ' '.join(parts)
         resp = self.send_until(req_str)
 
-        # 记录当前例程 ID，供 get_routine_result 使用（仅当子功能为 0x01 启动例程时记录）
         if not resp.is_negative and resp.head and len(resp.head) >= 1 and resp.head[0] == 0x01:
             self._current_routine_id = routine_id
         return resp
@@ -175,17 +216,13 @@ class Service(Session):
     def stop_routine(self, routine_id: int) -> bool:
         """
         停止例程（UDS 服务 0x31，子功能 0x02）
-        :param routine_id: 例程标识符（2 字节）
-        :return: 停止成功返回 True，失败返回 False
         """
         req_str = f"31 02 {routine_id:04X}"
         resp = self.send_until(req_str)
 
-        # 肯定响应应为 0x71, 子功能 0x02, 例程 ID
         if resp.check_fail(sid=0x71, head=0x02):
             return False
 
-        # 可选：校验响应中的例程 ID 是否一致
         if resp.head and len(resp.head) >= 2:
             returned_rid = int.from_bytes(resp.head[1:3], self._byte_order)
             if returned_rid != routine_id:
@@ -193,11 +230,9 @@ class Service(Session):
 
         return True
 
-    def get_routine_result(self, routine_id: int | None = None) -> UdsResponse:
+    def get_routine_result(self, routine_id: Optional[int] = None) -> UdsResponse:
         """
         获取例程结果（UDS 服务 0x31，子功能 0x03）
-        :param routine_id: 例程标识符（2 字节）。若不提供，则使用最近 start_routine 中记录的 ID
-        :return: 响应对象（肯定响应中包含例程输出参数）
         """
         rid = routine_id if routine_id is not None else self._current_routine_id
         if rid is None:
@@ -205,20 +240,3 @@ class Service(Session):
 
         req_str = f"31 03 {rid:04X}"
         return self.send_until(req_str)
-
-    def unlock_ssh(self) -> bool:
-        target = '40' if self._soc_num == 1 else '50'
-
-        resp = self.read_did(0xDC06)
-        if resp.check_fail(0x62, 0xDC06):
-            return False
-
-        status = to_bytes(resp.body)[-2:]
-        if to_bytes(status) != to_bytes(target):
-            return False
-
-        resp = self.write_did(0xDC06, to_bytes(target))
-        if resp.check_fail(0x6E, 0xDC06):
-            return False
-
-        return True

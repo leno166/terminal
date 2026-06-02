@@ -4,11 +4,11 @@
       无抽象类，无外部依赖（除 doip）
 """
 import threading
-from typing import Any, Callable, Literal, Self
+from typing import Any, Callable, Literal, Self, Optional
 from logging import getLogger
 from types import MappingProxyType
 
-from .DoIp import DoIPEndpoint
+from .doip import DoIPEndpoint
 from .response import UdsResponse
 
 logger = getLogger(__name__)
@@ -26,7 +26,7 @@ class KeepAlive:
         self._interval = interval
         self._payload = payload
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -60,28 +60,34 @@ class KeepAlive:
 class Session:
     """用户唯一入口：持有 Endpoint + KeepAlive"""
 
-    def __init__(self, ip: str, ecus: dict[str, tuple[str, int]],
-                 port: int = 13400, tester: int = 0x0E80,
-                 timeout: float = 1, listen_count: int = 10,
-                 doip_version: int = 0x02, doip_msg_type: int = 0x8001,
-                 byte_order: Literal['little', 'big'] = 'big',
-                 keepalive_interval: float = 0.5,
-                 keepalive_payload: bytes = b'\x3E\x00'):
+    def __init__(self,
+                 ip: str,
+                 ecus: dict[str, tuple[str, int]],
+                 doip: Optional['DoIPConfig'] = None,
+                 keepalive: Optional['KeepAliveConfig'] = None):
+        # 延迟导入避免循环依赖
+        from .service import DoIPConfig, KeepAliveConfig
+
+        doip = doip or DoIPConfig()
+        keepalive = keepalive or KeepAliveConfig()
+
         self._ip = ip
-        self._port = port
-        self._tester = tester
-        self._timeout = timeout
-        self._listen_count = listen_count
-        self._doip_version = doip_version
-        self._doip_msg_type = doip_msg_type
-        self._byte_order = byte_order
+        self._port = doip.port
+        self._tester = doip.tester
+        self._accept_timeout = doip.accept_timeout
+        self._recv_timeout = doip.recv_timeout
+        self._reconnect_timeout = doip.reconnect_timeout
+        self._listen_count = doip.listen_count
+        self._doip_version = doip.version
+        self._doip_msg_type = doip.msg_type
+        self._byte_order: Literal['little', 'big'] = doip.byte_order
         self._ecus = ecus.copy()
 
-        self._keepalive_interval = keepalive_interval
-        self._keepalive_payload = keepalive_payload
+        self._keepalive_interval = keepalive.interval
+        self._keepalive_payload = keepalive.payload
 
-        self._endpoint: DoIPEndpoint | None = None
-        self._keepalive: KeepAlive | None = None
+        self._endpoint: Optional[DoIPEndpoint] = None
+        self._keepalive: Optional[KeepAlive] = None
         self._cur_ecu: str = ''
         self._opened = False
         self._state_lock = threading.RLock()
@@ -163,7 +169,10 @@ class Session:
 
         endpoint = DoIPEndpoint(
             ip=self._ip, port=self._port, tester=self._tester,
-            timeout=self._timeout, listen_count=self._listen_count,
+            accept_timeout=self._accept_timeout,
+            recv_timeout=self._recv_timeout,
+            reconnect_timeout=self._reconnect_timeout,
+            listen_count=self._listen_count,
             version=self._doip_version, msg_type=self._doip_msg_type,
             byte_order=self._byte_order,
         )
