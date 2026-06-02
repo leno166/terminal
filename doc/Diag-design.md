@@ -18,7 +18,7 @@ src/workspace/module/Diag/
 └── errors.py         # DoIpProtocolError
 ```
 
-**核心模型**：`Session` 持有 `DoIPEndpoint` + `KeepAlive`。`Service(Session)` 提供 ISO 14229 标准诊断方法。IO 串行化由 `DoIPEndpoint` 内部 `threading.Lock` 保证。专有部分（PIN Code、Key 算法）由外部通过 `set_key_calculator()` 注入。
+**核心模型**：`Session` 持有 `DoIPEndpoint` + `KeepAlive`。`Service(Session)` 提供 ISO 14229 标准诊断方法。IO 串行化由 `DoIPEndpoint` 内部 `threading.Lock` 保证。专有部分（PIN Code、Key 算法、unlock_ssh）已移入独立 `oem/` 包，通过 `set_key_calculator()` 注入。
 
 ---
 
@@ -331,3 +331,100 @@ __all__ = ['Session', 'Service', 'UdsResponse',
 | 零配置文件 | `config/` 目录已删除。ip/ecus 显式传入 |
 | 参数收敛 | 14 个构造参数 → 5 个（ip, ecus, doip, keepalive, retry），默认值只在 Config dataclass |
 | timeout 三分 | `accept_timeout`（连接）、`recv_timeout`（响应）、`reconnect_timeout`（重连）独立 |
+
+---
+
+## 审计发现 & 处理策略
+
+以下问题已识别，不修改 Diag 模块本身。
+
+### #1 DoIP Routing Activation（不改）
+
+ISO 13400 要求发送 UDS 前先发路由激活请求（0x0005）。当前设计为 tester-as-server 模式，ECU 主动连接，跳过路由激活。这是合法的 DoIP 拓扑变体，不修改。
+
+### #2 `_filter_ecus()` 覆盖原始 ECU 列表
+
+**问题**：`Session.start()` 调用 `_filter_ecus()` 后，`self._ecus` 被替换为当前已连接 ECU 子集。`stop()` → `start()` 时，只有上次过滤后的 ECU 可被重连。
+
+**策略**：`__init__` 中保存 `self._ecus_original` 原始列表，`_filter_ecus()` 和 `start()` 始终从原始列表过滤，不修改 `self._ecus`。`self._ecus` 只读返回当前已连接的子集。
+
+### #3 无 ECU 地址/IP 校验
+
+**问题**：`ecus` dict 中的 logical_addr 无范围校验（合法 0x0001~0xFFFF），IP 字符串未校验格式。
+
+**策略**：在 `Session.__init__` 中添加轻量校验：
+- logical_addr: `0x0001 <= addr <= 0xFFFF`
+- IP: `socket.inet_aton()` 格式检查
+校验失败抛 `ValueError`，成本低，不影响性能路径。
+
+### #4 accept 单次循环
+
+**问题**：`_accept_once()` 在 `accept_timeout`（默认 1.5s）内循环收连接，超时即退出。ECU 若延迟上线会被永久遗漏。
+
+**策略**：这是设计取舍，非 bug。tester-as-server 模式下 ECU 应在 tester 启动前已在线。如需后上线支持，调用方可在外部重试 `start()` 或使用 `reconnect()` 针对特定 IP 重连。不修改。
+
+### #5 send_until 仅重试 NRC 0x78
+
+**问题**：ISO 14229 也定义了 NRC 0x21（busy）可重试。当前仅处理 0x78（responsePending）。
+
+**策略**：NRC 0x78 是唯一必须重试的码（ECU 明确要求等待）。0x21 在实践中极少触发，且重试可能加剧 ECU 负载。保持现状。如需扩展，`RetryConfig` 可加 `retryable_nrcs: set[int]` 字段。
+
+### #6 _POSITIVE_HEAD_LEN 未覆盖全部 SID
+
+**问题**：缺少 0x61(WriteMemoryByAddress)、0x72/0x73(Download/Upload) 等较新的 UDS 服务。
+
+**策略**：fallback 逻辑已正确处理未知 SID — `head = payload` 即全部作为 head 返回。不影响解析正确性，仅语义标注稍粗。后续按需补充表项即可，非紧急。
+
+---
+
+## OEM 包
+
+专有代码（Key 算法、PIN 查找表、unlock_ssh）移入独立 OEM 包，与 MIT 许可的 Diag 模块彻底分离。
+
+### 位置
+
+```
+src/workspace/oem/
+├── __init__.py              # 导出 make_key_calculator, unlock_ssh
+├── keys.py                  # calculate_key + get_pin_code + make_key_calculator 工厂
+├── platform.py              # unlock_ssh 等 OEM 专有方法
+└── config/
+    ├── __init__.py
+    ├── secrets.yaml          # 🔴 PIN Code 查找表（gitignored）
+    ├── secrets.example.yaml  # 模板（提交）
+    ├── connections.yaml      # 🟠 连接配置（gitignored）
+    └── connections.example.yaml  # 模板（提交）
+```
+
+### 使用方式
+
+```python
+from module.Diag import Service
+from oem import make_key_calculator, unlock_ssh
+
+ss = Service(ip='198.18.44.1', ecus={'mcu': ('198.18.44.49', 0x1301)})
+
+# 注入 OEM 的 key_calculator
+ss.set_key_calculator(make_key_calculator('P_G30TU'))
+
+with ss:
+    ss.change_session(0x03)
+    ss.change_level(0x05)
+
+    # OEM 扩展方法
+    unlock_ssh(ss, soc_num=1)
+```
+
+### keys.py 接口
+
+| 函数 | 签名 | 用途 |
+|------|------|------|
+| `calculate_key` | `(level, seed, pin_code) -> bytes` | 3字节 seed 自定义算法 + AES-CMAC |
+| `get_pin_code` | `(level, platform, serial_version) -> str` | 平台→PIN Code 查找 |
+| `make_key_calculator` | `(platform, serial_version) -> Callable` | 工厂：组装成 `(level, seed) -> bytes` 可注入 Diag |
+
+### platform.py 接口
+
+| 函数 | 签名 | 用途 |
+|------|------|------|
+| `unlock_ssh` | `(service, soc_num=1) -> bool` | OEM 私有 DID 0xDC06 SSH 解锁 |
