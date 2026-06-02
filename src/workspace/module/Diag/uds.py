@@ -58,7 +58,14 @@ class KeepAlive:
 # ================== Session ==================
 
 class Session:
-    """用户唯一入口：持有 Endpoint + KeepAlive"""
+    """用户入口：持有 Endpoint + KeepAlive。
+
+    Raises:
+        TypeError: send 传入非字符串。
+        ValueError: send 传入非法 hex、on 指定未知 ECU、_pre_send 长度非偶数。
+        RuntimeError: 在未 start 时调用 on/send、Endpoint 未初始化、
+                     未发现可连接的 ECU。
+    """
 
     def __init__(self,
                  ip: str,

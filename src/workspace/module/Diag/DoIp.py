@@ -35,7 +35,14 @@ class Sock:
 # ================== SocketManager ==================
 
 class SocketManager:
-    """server socket 生命周期 + 连接表路由 + 重连，不加锁"""
+    """server socket 生命周期 + 连接表路由 + 重连，不加锁。
+
+    由 DoIPEndpoint 保证单线程访问。
+
+    Raises:
+        RuntimeError: 未选中 ECU 时调用 send/recv、管理器未启动时调用 reconnect/accept。
+        ConnectionError: select 的 ip 不在连接表中、重连接收到非预期 ip。
+    """
 
     def __init__(self, sock_type: Optional[type[Sock]] = None):
         self._port = 0
@@ -162,7 +169,11 @@ class SocketManager:
 # ================== Protocol ==================
 
 class Protocol:
-    """DoIP 帧编解码，无状态。tester/ecu 每次调用传入"""
+    """DoIP 帧编解码，无状态。tester/ecu 每次调用传入。
+
+    Raises:
+        DoIpProtocolError: 帧格式校验失败 — 版本反码、Payload Type、长度、地址不匹配。
+    """
 
     ERROR = DoIpProtocolError
 
@@ -218,7 +229,12 @@ class Protocol:
 # ================== DoIPEndpoint ==================
 
 class DoIPEndpoint:
-    """DoIP 端点：整合 SocketManager + Protocol + 锁 + 重连决策，不对外暴露"""
+    """DoIP 端点：整合 SocketManager + Protocol + 锁 + 重连决策，不对外暴露。
+
+    Raises:
+        DoIpProtocolError: ecu 未设置时调用 send。
+        TimeoutError: 通信失败且重连后仍失败。
+    """
 
     def __init__(self,
                  ip: str, port: int, tester: int,

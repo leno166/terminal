@@ -48,7 +48,14 @@ class RetryConfig:
 # ================== Service ==================
 
 class Service(Session):
-    """UDS 标准诊断服务。继承 Session，提供 ISO 14229 协议方法。"""
+    """UDS 标准诊断服务。继承 Session，提供 ISO 14229 协议方法。
+
+    Raises:
+        ValueError: change_level 的 level 非 L 奇数 (0x01~0xFD)、
+                    get_routine_result 无 ID 且无最近启动记录。
+        RuntimeError: change_level 时 key_calculator 未注入、
+                      send_until 重试耗尽仍收到 NRC 0x78。
+    """
 
     def __init__(self,
                  ip: str,

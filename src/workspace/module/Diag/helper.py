@@ -11,6 +11,12 @@ from typing import Literal
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """
+    精确收取 size 字节。
+
+    Raises:
+        ConnectionError: 连接在收齐数据前关闭。
+    """
     data = bytearray()
 
     while len(data) < size:
@@ -36,6 +42,12 @@ def recv_frame(sock: socket.socket) -> bytes:
 
 def to_bytes(value: bytes | bytearray | str | int | None,
              byte_order: Literal['little', 'big'] = 'big') -> bytes:
+    """
+    统一类型 → bytes。
+
+    Raises:
+        TypeError: 传入不支持的类型。
+    """
     if value is None:
         return b''
 
