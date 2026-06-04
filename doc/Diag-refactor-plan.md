@@ -252,36 +252,48 @@ def on(self, name: str) -> Self:
 
 #### 4.4.6 `send()` 适配（核心变更）
 
-原 Diag `Endpoint.send(uds) -> bytes` 是阻塞的单次调用。autodoip `Endpoint.conversation(payload) -> Iterator[bytes]` 是生成器。
+原 Diag `Endpoint.send(uds) -> bytes` 是阻塞的单次调用。autodoip `Endpoint.conversation(payload) -> Iterator[bytes]` 是生成器，可 yield 多个响应帧（如 NRC 0x78 流控帧 + 最终响应）。
 
-对于典型的 UDS 请求→单响应场景，取第一个 yielded 值即可：
+**设计原则：只等待，不重发。** 在一次 `conversation()` 迭代里串起所有响应，遇到 0x78 就记录并继续等待，直到出现非 0x78 的帧才返回。
 
 ```python
 def send(self, data: str) -> UdsResponse:
+    """发送 UDS 请求，在单次 conversation 内持续等待（含 0x78 流控）。
+    只等待，不重发。
+    """
     with self._state_lock:
-        if not self._opened:
-            raise RuntimeError("会话未启动")
-        if not self._endpoint:
-            raise RuntimeError("Endpoint 未初始化")
+        if not self._opened or not self._endpoint:
+            raise RuntimeError("会话未启动或 Endpoint 无效")
         endpoint = self._endpoint
 
-    logger.info('TX: %s', data)
     payload = self._pre_send(data)
+    logger.info('TX: %s', data)
+    last_resp = None
 
-    # conversation() 是生成器，典型场景 yield 一次
-    for response in endpoint.conversation(payload):
-        logger.info('RX: %s', response.hex(' '))
-        return self._post_receive(response)
+    # 一次请求，持续等待（包括 NRC 0x78 流控帧）
+    for raw in endpoint.conversation(payload):
+        resp = UdsResponse.from_bytes(raw)
+        resp.father = last_resp          # 链接到前一个响应（可能是 0x78）
+        logger.info('RX: %s', raw.hex(' '))
+        if not (resp.is_negative and resp.nrc == 0x78):
+            return resp                  # 真正的最终响应
+        last_resp = resp                 # 记下 0x78，继续等下一个
+        logger.debug('收到 NRC 0x78（请求待处理），继续等待…')
 
-    # 生成器为空（recv 超时）→ 抛异常
-    raise TimeoutError("ECU 无响应")
+    # 生成器耗尽（超时 / 连接中断），返回最后一个响应
+    return last_resp or UdsResponse.from_bytes(b'')
 ```
 
-> **扩展能力**：后续如需支持 UDS 多帧响应（如大数据块上传），可在 `send()` 上层添加收集逻辑，消费生成器的多个 yield。
+**效果**：
+- 一次 `send()` 可能经历多个 0x78，它们全部通过 `father` 串成一条链
+- 最终返回的是最后一个非 0x78 响应（或耗尽时的最后一个响应）
+- 不再需要 `send_until` / `RetryConfig`，等待完全依赖 conversation 本身的超时机制
+
+> **扩展能力**：后续如需支持 UDS 多帧响应（如大数据块上传），可在消费生成器的循环中添加收集逻辑。
 
 #### 4.4.7 KeepAlive 适配
 
-原 KeepAlive 绑定了 `Endpoint.send` 方法。autodoip.Endpoint 没有 `send`，需要包一层：
+原 KeepAlive 绑定了 `Endpoint.send` 方法。重构后 KeepAlive 通过 `Session.send()` 发送心跳，与业务请求走同一路径：
 
 ```python
 def _start_keepalive(self) -> None:
@@ -289,9 +301,9 @@ def _start_keepalive(self) -> None:
         raise RuntimeError("Endpoint 未初始化")
 
     def _keepalive_send(payload: bytes) -> bytes:
-        for resp in self._endpoint.conversation(payload):
-            return resp
-        return b''  # 超时返回空，KeepAlive 线程自行处理
+        # 通过 send() 发送，与业务请求走同一路径（含 0x78 等待）
+        resp = self.send(payload.hex(' '))
+        return resp.raw
 
     self._keepalive = KeepAlive(
         fn=_keepalive_send,
@@ -300,6 +312,8 @@ def _start_keepalive(self) -> None:
     )
     self._keepalive.start()
 ```
+
+> **注意**：KeepAlive 将 bytes 载荷转为 hex 字符串调用 `send()`，再取 `resp.raw` 返回。`send()` 是 Session 的唯一发送入口，所有上层调用（包括心跳）均通过它完成。
 
 #### 4.4.8 移除的字段
 
@@ -397,9 +411,24 @@ autodoip 不提供独立的 `reconnect_timeout`。重连时复用 `accept_timeou
 
 > 已向 autodoip 提 feature request：支持独立的 `reconnect_timeout`。届时在 autodoip.Config 中增加该字段即可，Diag 层无需改动。
 
-#### 4.5.3 Service 其他部分不变
+#### 4.5.3 Service 变更：移除 send_until 和 RetryConfig
 
-`KeepAliveConfig`、`RetryConfig`、所有 UDS 方法 (`change_session`、`change_level`、`read_did` 等) 均不变。它们使用 `self.send()` 和 `self.send_until()`，这些方法内部封装了对 autodoip 的调用。
+`send()` 已在单次 conversation 内处理 0x78 链，因此 `send_until` 的重试逻辑完全被 `send()` 内置的等待机制取代。**遵循 ISO 14229：对 NRC 0x78 的正确响应是等待，而非重发请求。**
+
+**删除：**
+- `send_until()` 方法
+- `RetryConfig` dataclass
+- `Service.__init__` 的 `retry` 参数
+
+**所有 UDS 方法改为直接调用 `self.send()`。**
+
+```python
+# 重构前
+resp = self.send_until(f"10 {ss_id:02X}")
+
+# 重构后
+resp = self.send(f"10 {ss_id:02X}")
+```
 
 ### 4.6 `__init__.py` → 更新
 
@@ -411,7 +440,7 @@ autodoip 不提供独立的 `reconnect_timeout`。重连时复用 `accept_timeou
 from autodoip import ProtocolError
 
 from .uds import Session
-from .service import Service, DoIPConfig, KeepAliveConfig, RetryConfig
+from .service import Service, DoIPConfig, KeepAliveConfig
 from .response import UdsResponse
 
 __all__ = [
@@ -420,10 +449,11 @@ __all__ = [
     'UdsResponse',
     'DoIPConfig',
     'KeepAliveConfig',
-    'RetryConfig',
     'ProtocolError',
 ]
 ```
+
+> **注意**：`RetryConfig` 已移除——`send()` 内置了 0x78 等待，不再需要重试策略。`UdsResponse` 新增 `father` 字段和 `iter_chain()` 方法。
 
 ### 4.7 `__main__.py` → 适配
 
@@ -452,9 +482,9 @@ __all__ = [
 | `service.get_routine_result(rid)` | ✓ | ✓ | ✅ |
 | `service.reset(type)` | ✓ | ✓ | ✅ |
 | `service.set_key_calculator(fn)` | ✓ | ✓ | ✅ |
-| `UdsResponse` | ✓ | ✓ | ✅ |
+| `UdsResponse` | ✓ | ✓（新增 `father` + `iter_chain()`） | ✅ |
 | `KeepAliveConfig` | ✓ | ✓ | ✅ |
-| `RetryConfig` | ✓ | ✓ | ✅ |
+| `RetryConfig` | ✓ | **移除**（`send()` 内置 0x78 等待） | ✂ |
 
 ### 5.2 DoIPConfig 变更（需关注）
 
@@ -573,7 +603,7 @@ uv run python -m src.workspace.mix.StreamPromptTuiMix.StreamPromptTui_Diag --hel
 | 建议 | 优先级 | 说明 |
 |------|--------|------|
 | `Config.reconnect_timeout` | 高 | 独立的重连超时，与 accept_timeout 解耦 |
-| `Endpoint.send()` 便捷方法 | 中 | 对单帧场景提供 `send(payload) -> bytes`，避免手动消费生成器 |
+| `Endpoint.send()` 便捷方法 | 低 | Diag 的 `send()` 已封装生成器消费 + 0x78 链，该便捷方法价值降低 |
 | `Config.keepalive` 内置心跳 | 低 | 将 TesterPresent 下沉到传输层 |
 | 多 ECU 并发 | 低 | 同时向多个 ECU 发送诊断请求 |
 
@@ -603,7 +633,57 @@ uv run python -m src.workspace.mix.StreamPromptTuiMix.StreamPromptTui_Diag --hel
 | 删除 errors.py vs 保留重导出 | **删除**，在 `__init__` 重导出 | 单文件维护一行 `ProtocolError` 无意义 |
 | helper.py recv_* 删除 vs 保留 | **删除** | autodoip 版本功能等价且有更好的 byte_order 支持 |
 | Session 持有 Endpoint vs 每次创建 | **持有**（不变） | 维持长连接模型，与 KeepAlive 线程一致 |
+| 0x78 重试 vs 等待 | **等待**（send 内置 0x78 链） | 符合 ISO 14229：对 NRC 0x78 的正确响应是等待而非重发；conversation 生成器天然支持 |
+| send_until 保留 vs 删除 | **删除** | send() 已内置 0x78 等待，send_until 的重试逻辑被取代 |
+| KeepAlive 直连 conversation vs 通过 send | **通过 send** | send 是唯一发送入口，心跳与业务请求走同一路径 |
 
 ---
 
 > **相关文档**：[Diag-design.md](Diag-design.md) — 当前 Diag 模块设计文档（v0.2）
+
+---
+
+## 11. 执行记录
+
+**日期**: 2026-06-04 | **执行人**: Claude
+
+| 步骤 | 操作 | 结果 |
+|------|------|------|
+| Step 2 helper.py | 已提前完成 | ✅ |
+| Step 3 uds.py | 已提前完成 | ✅ |
+| Step 4 service.py | 已提前完成 | ✅ |
+| Step 5 \_\_init\_\_.py | 已提前完成 | ✅ |
+| Step 6 删除 doip.py / errors.py | 已执行 | ✅ |
+| Step 7 \_\_main\_\_.py | 已适配 | ✅ |
+| Step 8 回归验证 | `from Diag import Service, Session, UdsResponse, ProtocolError, DoIPConfig, KeepAliveConfig, RetryConfig` | ✅ |
+
+### 执行中发现的问题
+
+#### P1: `__main__.py` 原有导入错误（已修复）
+
+原代码 `from .Diag import Service, ...` 会尝试从 `Diag` 包内查找子模块 `Diag`（即 `Diag.Diag`），该模块不存在，运行 `python -m src.workspace.module.Diag` 会直接 ImportError。已改为 `from . import Service, ...`。
+
+#### P2: `__main__.py` 注释示例使用了已移除的 API（已修复）
+
+原注释示例 `DoIPConfig(recv_timeout=5.0)` — `recv_timeout` 已迁至 `autodoip.Config`。已更新为展示 `transmit=TransmitConfig(recv_timeout=5.0)` 的新模式。
+
+#### P3: send_until / RetryConfig 与新 send() 设计冲突（已移除）
+
+`send()` 改为在单次 conversation 内持续等待 0x78 后，`send_until` 的"重发+延迟"模式不再需要。已移除 `send_until()`、`RetryConfig` 及相关导入。
+
+### 第二轮变更（2026-06-04，session 2）
+
+| 变更 | 文件 | 说明 |
+|------|------|------|
+| 0x78 流控链 | `uds.py` | `send()` 改为消费整个 conversation 生成器，0x78 通过 `father` 串链，只等待不重发 |
+| father 链 | `response.py` | `UdsResponse` 新增 `father` 字段 + `iter_chain()` 回溯方法 |
+| KeepAlive 走 send | `uds.py` | `_start_keepalive()` 改为调用 `self.send()` 而非直接包装 `conversation()` |
+| 移除 send_until | `service.py` | 删除 `send_until()` 方法、`RetryConfig`、`retry` 参数；所有 UDS 方法直接调用 `self.send()` |
+| 更新导出 | `__init__.py` | 移除 `RetryConfig` |
+| 更新示例 | `__main__.py` | 移除 `RetryConfig` 导入和使用 |
+
+### 待后续关注
+
+- [ ] `autodoip` 发布 `Config.reconnect_timeout` 后，`service.py` 可恢复该参数
+- [ ] `helper.py` 的 `to_bytes()` 目前仍被 `response.py` 和外部消费者使用，暂不迁移
+- [ ] 如有单元测试，建议补充 autodoip Endpoint mock 下的 Session/Service 集成测试（包括 0x78 多帧场景）

@@ -3,41 +3,10 @@
 @作者: 雷小鸥
 @日期: 2026/5/27 10:48
 @许可: MIT License
-@描述: 工具函数 — 收帧、类型转换（平台无关）
-@版本: Version 0.2
+@描述: 工具函数 — 类型转换（平台无关）
+@版本: Version 0.3
 """
-import socket
 from typing import Literal
-
-
-def recv_exact(sock: socket.socket, size: int) -> bytes:
-    """
-    精确收取 size 字节。
-
-    Raises:
-        ConnectionError: 连接在收齐数据前关闭。
-    """
-    data = bytearray()
-
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-
-        if not chunk:
-            raise ConnectionError('连接已关闭')
-
-        data.extend(chunk)
-
-    return bytes(data)
-
-
-def recv_frame(sock: socket.socket) -> bytes:
-    header = recv_exact(sock, 8)
-
-    payload_length = int.from_bytes(header[4:8], 'big')
-
-    payload = recv_exact(sock, payload_length)
-
-    return header + payload
 
 
 def to_bytes(value: bytes | bytearray | str | int | None,

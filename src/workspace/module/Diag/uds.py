@@ -1,14 +1,15 @@
 """
 @文件: uds.py
 @描述: UDS 层 — KeepAlive + Session
-      无抽象类，无外部依赖（除 doip）
+      传输层委托给 autodoip 包
 """
 import threading
-from typing import Any, Callable, Literal, Self, Optional
+from typing import Any, Callable, Self, Optional
 from logging import getLogger
 from types import MappingProxyType
 
-from .doip import Endpoint
+from autodoip import Endpoint, Config
+
 from .response import UdsResponse
 
 logger = getLogger(__name__)
@@ -58,7 +59,7 @@ class KeepAlive:
 # ================== Session ==================
 
 class Session:
-    """用户入口：持有 Endpoint + KeepAlive。
+    """用户入口：持有 autodoip.Endpoint + KeepAlive。
 
     Raises:
         TypeError: send 传入非字符串。
@@ -69,31 +70,49 @@ class Session:
 
     def __init__(self,
                  ip: str,
-                 ecus: dict[str, tuple[str, int]],
-                 doip: Optional['DoIPConfig'] = None,
+                 ecus: dict[str, tuple],
+                 port: int = 13400,
+                 tester: int = 0x0E80,
+                 transmit: Optional[Config] = None,
                  keepalive: Optional['KeepAliveConfig'] = None):
         # 延迟导入避免循环依赖
-        from .service import DoIPConfig, KeepAliveConfig
+        from .service import KeepAliveConfig
 
-        doip = doip or DoIPConfig()
+        transmit = transmit or Config()
         keepalive = keepalive or KeepAliveConfig()
 
         self._ip = ip
-        self._port = doip.port
-        self._tester = doip.tester
-        self._accept_timeout = doip.accept_timeout
-        self._recv_timeout = doip.recv_timeout
-        self._reconnect_timeout = doip.reconnect_timeout
-        self._listen_count = doip.listen_count
-        self._doip_version = doip.version
-        self._doip_msg_type = doip.msg_type
-        self._byte_order: Literal['little', 'big'] = doip.byte_order
-        self._ecus = ecus.copy()
+        self._tester = tester
+        self._port = port
 
+        # 解析 ECU 表 — 新格式: {name: (logical_addr, ip)} 或 {name: (logical_addr, ip, port)}
+        # port=0 表示使用 session 默认端口
+        self._ecus: dict[str, tuple[int, str]] = {}        # {name: (logical_addr, ip)}
+        self._ecu_names: dict[int, str] = {}                # {logical_addr: name}
+        autodoip_ecus: dict[int, tuple[str, int]] = {}      # {logical_addr: (ip, port)}
+
+        for name, ecu_tuple in ecus.items():
+            addr, ecu_ip, *rest = ecu_tuple
+            ecu_port = rest[0] if rest else 0
+            if ecu_port == 0:
+                ecu_port = port
+
+            self._ecus[name] = (addr, ecu_ip)
+            self._ecu_names[addr] = name
+            autodoip_ecus[addr] = (ecu_ip, ecu_port)
+
+        self._endpoint = Endpoint(
+            ip=ip,
+            ecus=autodoip_ecus,
+            port=port,
+            tester=tester,
+            config=transmit,
+        )
+
+        self._byte_order = transmit.byte_order
         self._keepalive_interval = keepalive.interval
         self._keepalive_payload = keepalive.payload
 
-        self._endpoint: Optional[Endpoint] = None
         self._keepalive: Optional[KeepAlive] = None
         self._cur_ecu: str = ''
         self._opened = False
@@ -126,17 +145,17 @@ class Session:
         except ValueError:
             raise ValueError(f'非法 UDS 数据: {data}')
 
-    @staticmethod
-    def _post_receive(data: bytes) -> UdsResponse:
-        """后置：返回字节粗略拆分为空格分隔的 hex 字符串"""
-        return UdsResponse.from_bytes(data)
-
     def _start_keepalive(self) -> None:
         if not self._endpoint:
             raise RuntimeError("Endpoint 未初始化")
 
+        def _keepalive_send(payload: bytes) -> bytes:
+            # 通过 send() 发送，与业务请求走同一路径
+            resp = self.send(payload.hex(' '))
+            return resp.raw
+
         self._keepalive = KeepAlive(
-            fn=self._endpoint.send,
+            fn=_keepalive_send,
             interval=self._keepalive_interval,
             payload=self._keepalive_payload,
         )
@@ -147,15 +166,16 @@ class Session:
             self._keepalive.stop()
             self._keepalive = None
 
-    def _filter_ecus(self) -> dict[str, tuple[str, int]]:
+    def _filter_ecus(self) -> dict[str, tuple[int, str]]:
         if not self._endpoint:
             raise RuntimeError("Endpoint 未初始化")
 
-        connections = self._endpoint.connections()
+        # autodoip connections: {logical_addr: (ip, port, connected)}
+        conns = self._endpoint.connections()
         filtered = {}
-        for name, (ip, ecu) in self._ecus.items():
-            if ip in connections:
-                filtered[name] = (ip, ecu)
+        for name, (addr, ip) in self._ecus.items():
+            if addr in conns and conns[addr][2]:  # connected == True
+                filtered[name] = (addr, ip)
         if not filtered:
             raise RuntimeError("未发现可连接的 ECU")
         return filtered
@@ -174,17 +194,7 @@ class Session:
             if self._opened:
                 return True
 
-        endpoint = Endpoint(
-            ip=self._ip, port=self._port, tester=self._tester,
-            accept_timeout=self._accept_timeout,
-            recv_timeout=self._recv_timeout,
-            reconnect_timeout=self._reconnect_timeout,
-            listen_count=self._listen_count,
-            version=self._doip_version, msg_type=self._doip_msg_type,
-            byte_order=self._byte_order,
-        )
-        endpoint.start()
-        self._endpoint = endpoint
+        self._endpoint.start()
 
         self._ecus = self._filter_ecus()
 
@@ -207,7 +217,6 @@ class Session:
         self._stop_keepalive()
         if self._endpoint:
             self._endpoint.stop()
-            self._endpoint = None
 
         logger.info('会话已关闭')
         return True
@@ -218,29 +227,42 @@ class Session:
                 raise RuntimeError("会话未启动")
             if name not in self._ecus:
                 raise ValueError(f"未知 ECU: {name}")
-            ip, ecu = self._ecus[name]
+            addr, ip = self._ecus[name]
             self._cur_ecu = name
 
         if not self._endpoint:
             raise RuntimeError("Endpoint 未初始化")
 
         self._stop_keepalive()
-        self._endpoint.select(ip, ecu)
+        # autodoip 按逻辑地址选择
+        self._endpoint.select(addr)
         self._start_keepalive()
 
-        logger.info('已切换到 ECU: %s, IP: %s, 地址: 0x%04X', name, ip, ecu)
+        logger.info('已切换到 ECU: %s, IP: %s, 地址: 0x%04X', name, ip, addr)
         return self
 
     def send(self, data: str) -> UdsResponse:
+        """发送 UDS 请求，在单次 conversation 内持续等待（含 0x78 流控）。
+        只等待，不重发。
+        """
         with self._state_lock:
-            if not self._opened:
-                raise RuntimeError("会话未启动")
-            if not self._endpoint:
-                raise RuntimeError("Endpoint 未初始化")
+            if not self._opened or not self._endpoint:
+                raise RuntimeError("会话未启动或 Endpoint 无效")
             endpoint = self._endpoint
 
-        logger.info('TX: %s', data)
         payload = self._pre_send(data)
-        response = endpoint.send(payload)
-        logger.info('RX: %s', response.hex(' '))
-        return self._post_receive(response)
+        logger.info('TX: %s', data)
+        last_resp = None
+
+        # 一次请求，持续等待（包括 NRC 0x78 流控帧）
+        for raw in endpoint.conversation(payload):
+            resp = UdsResponse.from_bytes(raw)
+            resp.father = last_resp
+            logger.info('RX: %s', raw.hex(' '))
+            if not (resp.is_negative and resp.nrc == 0x78):
+                return resp                  # 真正的最终响应
+            last_resp = resp                 # 记下 0x78，继续等下一个
+            logger.debug('收到 NRC 0x78（请求待处理），继续等待…')
+
+        # 生成器耗尽（超时 / 连接中断），返回最后一个响应
+        return last_resp or UdsResponse.from_bytes(b'')

@@ -7,7 +7,7 @@
 @版本: Version 0.1
 """
 from dataclasses import dataclass, field
-from typing import Self
+from typing import Optional, Self
 from .helper import to_bytes
 
 
@@ -28,6 +28,9 @@ class UdsResponse:
     request_sid: int | None = None
     nrc: int | None = None
     nrc_desc: str | None = None
+
+    # 响应链：指向同一请求的前一个响应（如 0x78 流控帧）
+    father: Optional['UdsResponse'] = field(default=None, init=False, repr=False)
 
     # 辅助属性：十六进制字符串表示（便于打印）
     hex_str: str = field(default="", init=False, repr=False)
@@ -169,6 +172,18 @@ class UdsResponse:
             return True
 
         return False
+
+    def iter_chain(self):
+        """从最新响应回溯到最初请求（包含中间的 0x78 流控帧）。
+
+        示例：
+            for resp in response.iter_chain():
+                print(resp.nrc_desc or 'OK')
+        """
+        resp = self
+        while resp is not None:
+            yield resp
+            resp = resp.father
 
     @classmethod
     def from_bytes(cls, data: bytes) -> Self:

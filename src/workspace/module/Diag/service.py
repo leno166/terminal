@@ -4,11 +4,12 @@
 @日期: 2026/6/2 14:44
 @许可: MIT License
 @描述: Service 层 — 配置 dataclass + UDS 标准诊断操作
-@版本: Version 0.2
+@版本: Version 0.3
 """
-import time
 from dataclasses import dataclass
-from typing import Callable, Literal, Tuple, Optional
+from typing import Callable, Optional, Tuple
+
+from autodoip import Config
 
 from .uds import Session
 from .response import UdsResponse
@@ -18,31 +19,10 @@ from .helper import to_bytes
 # ================== 配置 dataclass ==================
 
 @dataclass
-class DoIPConfig:
-    """DoIP 传输层配置"""
-    port: int = 13400
-    tester: int = 0x0E80
-    accept_timeout: float = 1.5      # 初始 accept 等待 ECU 连接
-    recv_timeout: float = 3.0        # 客户端 socket recv 等待 UDS 响应
-    reconnect_timeout: float = 5.0   # 断连后重建连接的 accept 等待
-    listen_count: int = 10
-    version: int = 0x02
-    msg_type: int = 0x8001
-    byte_order: Literal['little', 'big'] = 'big'
-
-
-@dataclass
 class KeepAliveConfig:
     """TesterPresent 保活配置"""
     interval: float = 1.5
     payload: bytes = b'\x3E\x00'
-
-
-@dataclass
-class RetryConfig:
-    """send_until 重试策略（ISO 14229 NRC 0x78 标准）"""
-    count: int = 3
-    delay: float = 0.5
 
 
 # ================== Service ==================
@@ -53,27 +33,27 @@ class Service(Session):
     Raises:
         ValueError: change_level 的 level 非 L 奇数 (0x01~0xFD)、
                     get_routine_result 无 ID 且无最近启动记录。
-        RuntimeError: change_level 时 key_calculator 未注入、
-                      send_until 重试耗尽仍收到 NRC 0x78。
+        RuntimeError: change_level 时 key_calculator 未注入。
     """
 
     def __init__(self,
                  ip: str,
-                 ecus: dict[str, tuple[str, int]],
-                 doip: Optional[DoIPConfig] = None,
-                 keepalive: Optional[KeepAliveConfig] = None,
-                 retry: Optional[RetryConfig] = None):
-        doip = doip or DoIPConfig()
+                 ecus: dict[str, tuple],
+                 port: int = 13400,
+                 tester: int = 0x0E80,
+                 transmit: Optional[Config] = None,
+                 keepalive: Optional[KeepAliveConfig] = None):
+        transmit = transmit or Config()
         keepalive = keepalive or KeepAliveConfig()
 
         super().__init__(
             ip=ip,
             ecus=ecus,
-            doip=doip,
+            port=port,
+            tester=tester,
+            transmit=transmit,
             keepalive=keepalive,
         )
-
-        self._retry = retry or RetryConfig()
 
         # --- 状态 ---
         self.session = 0x01
@@ -91,24 +71,6 @@ class Service(Session):
         """注入 Key 计算回调。fn(level, seed) -> key_bytes。必须调用。"""
         self._key_calculator = fn
 
-    # ================== 内部辅助 ==================
-
-    def send_until(self, data: str, count: Optional[int] = None,
-                   retry_delay: Optional[float] = None) -> UdsResponse:
-        count = count if count is not None else self._retry.count
-        retry_delay = retry_delay if retry_delay is not None else self._retry.delay
-
-        for attempt in range(count):
-            resp = self.send(data)
-
-            if resp.is_negative and resp.nrc == 0x78:
-                time.sleep(retry_delay)
-                continue
-
-            return resp
-
-        raise RuntimeError("请求重复失败，已达到最大重试次数")
-
     # ================== UDS 标准服务 ==================
 
     def change_session(self, ss_id: int) -> Tuple[bool, UdsResponse]:
@@ -116,7 +78,7 @@ class Service(Session):
         切换诊断会话（UDS 服务 0x10）
         :param ss_id: 会话类型，如 1=默认会话，2=编程会话，3=扩展会话等
         """
-        resp = self.send_until(f"10 {ss_id:02X}")
+        resp = self.send(f"10 {ss_id:02X}")
 
         if resp.check_fail(0x50, ss_id):
             return False, resp
@@ -141,13 +103,13 @@ class Service(Session):
                 "fn(level: int, seed: bytes) -> bytes 负责 PIN 查找和 Key 计算。"
             )
 
-        resp = self.send_until(f'27 {level:02X}')
+        resp = self.send(f'27 {level:02X}')
         if resp.check_fail(0x67, level):
             return False, resp
 
         seed = to_bytes(resp.body)
         key = self._key_calculator(level, seed)
-        resp = self.send_until(f'27 {level + 1:02X} {key.hex()}')
+        resp = self.send(f'27 {level + 1:02X} {key.hex()}')
         if resp.check_fail(0x67, level + 1):
             return False, resp
 
@@ -172,7 +134,7 @@ class Service(Session):
         ECU 复位（UDS 服务 0x11）
         :param reset_type: 复位类型，0x01=硬复位，0x02=钥匙关/开复位，0x03=软复位等
         """
-        resp = self.send_until(f"11 {reset_type:02X}")
+        resp = self.send(f"11 {reset_type:02X}")
         if resp.check_fail(sid=0x51, head=reset_type):
             return False
         return True
@@ -181,7 +143,7 @@ class Service(Session):
                                 ss_id: Optional[int] = None,
                                 level: Optional[int] = None) -> UdsResponse:
         self.change_any(ss_id, level)
-        return self.send_until(f'22 {did:04X}')
+        return self.send(f'22 {did:04X}')
 
     def read_did(self, did: int,
                  ss_id: Optional[int] = None,
@@ -192,7 +154,7 @@ class Service(Session):
                                  ss_id: Optional[int] = None,
                                  level: Optional[int] = None) -> UdsResponse:
         self.change_any(ss_id, level)
-        return self.send_until(f'2E {did:04X} {data.hex()}')
+        return self.send(f'2E {did:04X} {data.hex()}')
 
     def write_did(self, did: int, data: bytes,
                   ss_id: Optional[int] = None,
@@ -216,7 +178,7 @@ class Service(Session):
         if data:
             parts.append(data.hex())
         req_str = ' '.join(parts)
-        resp = self.send_until(req_str)
+        resp = self.send(req_str)
 
         if not resp.is_negative and resp.head and len(resp.head) >= 1 and resp.head[0] == 0x01:
             self._current_routine_id = routine_id
@@ -227,7 +189,7 @@ class Service(Session):
         停止例程（UDS 服务 0x31，子功能 0x02）
         """
         req_str = f"31 02 {routine_id:04X}"
-        resp = self.send_until(req_str)
+        resp = self.send(req_str)
 
         if resp.check_fail(sid=0x71, head=0x02):
             return False
@@ -248,4 +210,4 @@ class Service(Session):
             raise ValueError("未提供例程 ID 且没有最近启动的例程记录")
 
         req_str = f"31 03 {rid:04X}"
-        return self.send_until(req_str)
+        return self.send(req_str)
