@@ -192,4 +192,3 @@ class UdsResponse:
             instance._parse_positive(data)
 
         return instance
-

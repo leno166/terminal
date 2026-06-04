@@ -8,7 +8,7 @@ from typing import Any, Callable, Literal, Self, Optional
 from logging import getLogger
 from types import MappingProxyType
 
-from .doip import DoIPEndpoint
+from .doip import Endpoint
 from .response import UdsResponse
 
 logger = getLogger(__name__)
@@ -93,7 +93,7 @@ class Session:
         self._keepalive_interval = keepalive.interval
         self._keepalive_payload = keepalive.payload
 
-        self._endpoint: Optional[DoIPEndpoint] = None
+        self._endpoint: Optional[Endpoint] = None
         self._keepalive: Optional[KeepAlive] = None
         self._cur_ecu: str = ''
         self._opened = False
@@ -174,7 +174,7 @@ class Session:
             if self._opened:
                 return True
 
-        endpoint = DoIPEndpoint(
+        endpoint = Endpoint(
             ip=self._ip, port=self._port, tester=self._tester,
             accept_timeout=self._accept_timeout,
             recv_timeout=self._recv_timeout,

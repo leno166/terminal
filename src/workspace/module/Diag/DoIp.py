@@ -1,6 +1,6 @@
 """
 @文件: doip.py
-@描述: DoIP 层 — Endpoint + SocketManager + Protocol + Sock
+@描述: DoIp 层 — Endpoint + SocketManager + Protocol + Sock
       无抽象类，无外部依赖（除 socket 和 helper）
 """
 import threading
@@ -9,7 +9,7 @@ from typing import Literal, Optional
 from logging import getLogger
 
 from .helper import recv_frame
-from .errors import DoIpProtocolError
+from .errors import ProtocolError
 
 logger = getLogger(__name__)
 
@@ -37,7 +37,7 @@ class Sock:
 class SocketManager:
     """server socket 生命周期 + 连接表路由 + 重连，不加锁。
 
-    由 DoIPEndpoint 保证单线程访问。
+    由 DoIpEndpoint 保证单线程访问。
 
     Raises:
         RuntimeError: 未选中 ECU 时调用 send/recv、管理器未启动时调用 reconnect/accept。
@@ -66,7 +66,7 @@ class SocketManager:
         sock.bind((ip, port))
         sock.listen(listen_count)
         self._sock = sock
-        logger.info("DoIP 服务启动，监听 %s:%s，backlog %d", ip, port, listen_count)
+        logger.info("DoIp 服务启动，监听 %s:%s，backlog %d", ip, port, listen_count)
         self._accept_once()
 
     def stop(self) -> None:
@@ -169,13 +169,13 @@ class SocketManager:
 # ================== Protocol ==================
 
 class Protocol:
-    """DoIP 帧编解码，无状态。tester/ecu 每次调用传入。
+    """DoIp 帧编解码，无状态。tester/ecu 每次调用传入。
 
     Raises:
         DoIpProtocolError: 帧格式校验失败 — 版本反码、Payload Type、长度、地址不匹配。
     """
 
-    ERROR = DoIpProtocolError
+    ERROR = ProtocolError
 
     def __init__(self, version: int, msg_type: int, byte_order: Literal['little', 'big']):
         self._version = version
@@ -226,10 +226,10 @@ class Protocol:
         return frame[12:]
 
 
-# ================== DoIPEndpoint ==================
+# ================== DoIpEndpoint ==================
 
-class DoIPEndpoint:
-    """DoIP 端点：整合 SocketManager + Protocol + 锁 + 重连决策，不对外暴露。
+class Endpoint:
+    """DoIp 端点：整合 SocketManager + Protocol + 锁 + 重连决策，不对外暴露。
 
     Raises:
         DoIpProtocolError: ecu 未设置时调用 send。
@@ -272,7 +272,7 @@ class DoIPEndpoint:
 
     def send(self, uds: bytes) -> bytes:
         if self._ecu is None:
-            raise Protocol.ERROR('[DoIp] 没有设置 ecu 逻辑地址')
+            raise Protocol.ERROR('DoIp 没有设置 ecu 逻辑地址')
 
         frame = self._protocol.encode(uds, self._tester, self._ecu)
         logger.debug('TX DoIp: %s', frame.hex(' '))
@@ -282,7 +282,7 @@ class DoIPEndpoint:
                 self._manager.send(frame)
                 response = self._manager.recv()
             except (ConnectionError, TimeoutError, OSError) as e:
-                logger.warning('DoIP 通信失败，触发重连: %s', e)
+                logger.warning('DoIp 通信失败，触发重连: %s', e)
                 self._manager.reconnect(timeout=self._reconnect_timeout)
                 self._manager.send(frame)
 

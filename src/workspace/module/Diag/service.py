@@ -207,6 +207,8 @@ class Service(Session):
         启动例程（UDS 服务 0x31，子功能 0x01）
         :param routine_id: 例程标识符（2 字节）
         :param data:    可选的例程输入参数
+        :param ss_id:    可选的例程输入参数
+        :param level:    可选的例程输入参数
         """
         self.change_any(ss_id, level)
 

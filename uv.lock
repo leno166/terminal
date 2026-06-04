@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.14"
+
+[[package]]
+name = "autodoip"
+version = "0.1.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/9a/b5d5423479f2ee2177896ddee4565bd3c7df1fc27de2c52c5f57ba58f024/autodoip-0.1.3.tar.gz", hash = "sha256:a0f54ef3e598752b4409c65cc5761ac1191e8b83f57372a83f73c57879dd44ac", size = 16377, upload-time = "2026-06-04T13:50:02.362Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/bc/110d5438f19b800a2a147497559294e9235afc64b5609a340dd2ec027b8b/autodoip-0.1.3-py3-none-any.whl", hash = "sha256:3b70cce9b2ae81e43160fd11968e7ae2642a545283060d5b53a69cb8c12f213e", size = 8070, upload-time = "2026-06-04T13:49:59.823Z" },
+]
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "autodoip" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "autodoip", specifier = ">=0.1.3" }]
