@@ -1,5 +1,5 @@
 """
-@文件: uds.py
+@文件: core.py
 @描述: UDS 层 — KeepAlive + Session
       传输层委托给 autodoip 包
 """

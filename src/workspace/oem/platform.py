@@ -2,8 +2,8 @@
 @文件: platform.py
 @描述: OEM 平台专有方法 — unlock_ssh 等非 UDS 标准的扩展操作
 """
-from module.Diag.service import Service
-from module.Diag.helper import to_bytes
+from module.Uds.service import Service
+from module.Uds.helper import to_bytes
 
 
 def unlock_ssh(service: Service, soc_num: int = 1) -> bool:

@@ -11,7 +11,7 @@ from typing import Callable, Optional, Tuple
 
 from autodoip import Config
 
-from .uds import Session
+from .core import Session
 from .response import UdsResponse
 from .helper import to_bytes
 

@@ -372,7 +372,7 @@ class DoIPConfig:
 # 重构后 — 方案 A（推荐）：拆分为两个独立配置
 @dataclass
 class DoIPConfig:
-    """Diag 层 DoIP 配置 — 仅 Diag 特有参数"""
+    """Uds 层 DoIP 配置 — 仅 Uds 特有参数"""
     port: int = 13400
     tester: int = 0x0E80
     # transmit 层参数独立传入 autodoip.Config
@@ -435,7 +435,7 @@ resp = self.send(f"10 {ss_id:02X}")
 ```python
 """
 @文件: __init__.py
-@描述: Diag — UDS 诊断模块（基于 autodoip 传输层）
+@描述: Uds — UDS 诊断模块（基于 autodoip 传输层）
 """
 from autodoip import ProtocolError
 
@@ -560,8 +560,8 @@ uv run python -c "from autodoip import Endpoint, Config, ProtocolError; print('O
 ### Step 6：删除文件
 
 ```bash
-rm src/workspace/module/Diag/doip.py
-rm src/workspace/module/Diag/errors.py
+rm src/workspace/module/Uds/doip.py
+rm src/workspace/module/Uds/errors.py
 ```
 
 ### Step 7：更新 `__main__.py`

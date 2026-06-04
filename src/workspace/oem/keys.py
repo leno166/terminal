@@ -2,7 +2,7 @@
 @文件: keys.py
 @描述: OEM Key 算法 + PIN Code 管理
       包含 calculate_key（3字节 seed 自定义算法 + AES-CMAC）和 get_pin_code。
-      通过 make_key_calculator() 工厂组装成 Diag 可注入的回调。
+      通过 make_key_calculator() 工厂组装成 Uds 可注入的回调。
 """
 from Crypto.Cipher import AES
 from Crypto.Hash import CMAC
